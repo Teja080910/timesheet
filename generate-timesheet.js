@@ -283,7 +283,7 @@ function extractTicket(commitMessage, branchNames = []) {
     }
   }
 
-  return 'GENERAL';
+  return 'PF-16716';
 }
 
 function extractCommitAuthorEmails(commit) {
