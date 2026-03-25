@@ -2,3 +2,4 @@ node_modules
 .env
 timesheet*
 commits-today*
+!api/timesheet.js
