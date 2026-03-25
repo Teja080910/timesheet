@@ -10,7 +10,7 @@ const axios = require('axios');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
-const MAX_DAILY_HOURS = 10;
+const MAX_DAILY_HOURS = 12;
 const MIN_DAILY_HOURS = 8;
 const DEFAULT_START_HOUR = '09:00:00.000+0530';
 const OUTPUT_FILE = path.join(process.cwd(), 'timesheet.json');
