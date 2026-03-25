@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/timesheet.js": {
+      "maxDuration": 60
+    }
+  }
+}

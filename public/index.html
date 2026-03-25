@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Timesheet Generator</title>
+    <style>
+      :root {
+        --bg: #f6f2e8;
+        --panel: rgba(255, 252, 245, 0.92);
+        --border: #d8cdb8;
+        --text: #1f1c17;
+        --muted: #5f564a;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --danger: #b42318;
+        --shadow: 0 24px 60px rgba(31, 28, 23, 0.14);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: Georgia, "Times New Roman", serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 35%),
+          radial-gradient(circle at bottom right, rgba(180, 35, 24, 0.08), transparent 30%),
+          linear-gradient(135deg, #efe6d4 0%, #f8f4eb 55%, #efe9dc 100%);
+      }
+
+      .shell {
+        width: min(960px, calc(100vw - 32px));
+        margin: 40px auto;
+        padding: 28px;
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(12px);
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: clamp(2rem, 5vw, 3.5rem);
+        line-height: 0.95;
+        letter-spacing: -0.04em;
+      }
+
+      p {
+        margin: 0 0 20px;
+        color: var(--muted);
+        max-width: 60ch;
+      }
+
+      form {
+        display: grid;
+        gap: 16px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 16px;
+      }
+
+      label {
+        display: grid;
+        gap: 8px;
+        font-size: 0.92rem;
+      }
+
+      input,
+      select,
+      button,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px 14px;
+        font: inherit;
+        color: inherit;
+        background: rgba(255, 255, 255, 0.82);
+      }
+
+      button {
+        border: none;
+        cursor: pointer;
+        font-weight: 700;
+        color: #f7fbfa;
+        background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      }
+
+      button:disabled {
+        cursor: wait;
+        opacity: 0.7;
+      }
+
+      .hint {
+        font-size: 0.88rem;
+        color: var(--muted);
+      }
+
+      .status {
+        min-height: 1.4em;
+        font-size: 0.94rem;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      pre {
+        margin: 0;
+        padding: 18px;
+        overflow: auto;
+        border-radius: 18px;
+        border: 1px solid #d2c6b0;
+        background: #1c1917;
+        color: #f8fafc;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 0.87rem;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <h1>Timesheet Generator</h1>
+      <p>
+        This deployment runs the existing Bitbucket to Jira generator as a Vercel API.
+        Use dry run first. Real uploads will create or update Jira worklogs.
+      </p>
+
+      <form id="timesheet-form">
+        <div class="grid">
+          <label>
+            API token
+            <input id="token" name="token" type="password" required />
+          </label>
+          <label>
+            Mode
+            <select id="dryRun" name="dryRun">
+              <option value="true">Dry run</option>
+              <option value="false">Upload to Jira</option>
+            </select>
+          </label>
+          <label>
+            Days
+            <input id="days" name="days" type="number" min="1" value="7" />
+          </label>
+        </div>
+
+        <div class="grid">
+          <label>
+            Start date
+            <input id="startDate" name="startDate" type="date" />
+          </label>
+          <label>
+            End date
+            <input id="endDate" name="endDate" type="date" />
+          </label>
+        </div>
+
+        <div class="hint">
+          If `startDate` and `endDate` are set, they override `days`.
+        </div>
+
+        <button id="submit" type="submit">Run generator</button>
+        <div id="status" class="status"></div>
+      </form>
+
+      <pre id="output">Waiting for input.</pre>
+    </main>
+
+    <script>
+      const form = document.getElementById('timesheet-form');
+      const submitButton = document.getElementById('submit');
+      const statusElement = document.getElementById('status');
+      const outputElement = document.getElementById('output');
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        submitButton.disabled = true;
+        statusElement.textContent = 'Running request...';
+        statusElement.className = 'status';
+        outputElement.textContent = 'Loading...';
+
+        const formData = new FormData(form);
+        const payload = {
+          token: formData.get('token'),
+          dryRun: formData.get('dryRun') === 'true',
+          days: Number(formData.get('days')),
+        };
+
+        const startDate = formData.get('startDate');
+        const endDate = formData.get('endDate');
+
+        if (startDate) {
+          payload.startDate = startDate;
+        }
+
+        if (endDate) {
+          payload.endDate = endDate;
+        }
+
+        try {
+          const response = await fetch('/api/timesheet', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const data = await response.json();
+          outputElement.textContent = JSON.stringify(data, null, 2);
+
+          if (!response.ok) {
+            statusElement.textContent = data.error || 'Request failed.';
+            statusElement.className = 'status error';
+            return;
+          }
+
+          statusElement.textContent = 'Completed.';
+        } catch (error) {
+          outputElement.textContent = '';
+          statusElement.textContent = error.message || String(error);
+          statusElement.className = 'status error';
+        } finally {
+          submitButton.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

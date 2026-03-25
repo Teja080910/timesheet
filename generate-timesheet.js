@@ -10,7 +10,7 @@ const axios = require('axios');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
-const MAX_DAILY_HOURS = 12;
+const MAX_DAILY_HOURS = 10;
 const MIN_DAILY_HOURS = 8;
 const DEFAULT_START_HOUR = '09:00:00.000+0530';
 const OUTPUT_FILE = path.join(process.cwd(), 'timesheet.json');
@@ -962,6 +962,19 @@ async function writeCommitsOutput(payload) {
   console.log(`Saved output to ${COMMITS_OUTPUT_FILE}`);
 }
 
+function buildFilters(range, cliArgs, repoSlugs) {
+  return {
+    startDate: range.startDateStr,
+    endDate: range.endDateStr,
+    dryRun: cliArgs.dryRun,
+    repos: repoSlugs.map((repo) => repo.key),
+    branches: getConfiguredBranches(),
+    branchPatterns: getConfiguredBranchPatterns(),
+    maxBranches: getConfiguredMaxBranches(),
+    authorEmails: getConfiguredAuthorEmails(),
+  };
+}
+
 function printTimesheet(timesheet) {
   console.log('\nGenerated timesheet:\n');
 
@@ -982,16 +995,27 @@ function printTimesheet(timesheet) {
 
 async function main() {
   const cliArgs = parseArgs(process.argv.slice(2));
-  validateEnv({ dryRun: cliArgs.dryRun });
-  const range = resolveDateRange(cliArgs);
+  await runGenerator(cliArgs, { persistOutput: true });
+}
+
+async function runGenerator(cliArgs = {}, options = {}) {
+  const normalizedArgs = {
+    dryRun: Boolean(cliArgs.dryRun),
+    startDate: cliArgs.startDate || null,
+    endDate: cliArgs.endDate || null,
+    days: cliArgs.days ?? DEFAULT_LOOKBACK_DAYS,
+  };
+
+  validateEnv({ dryRun: normalizedArgs.dryRun });
+  const range = resolveDateRange(normalizedArgs);
   const repoSlugs = getConfiguredRepos();
 
   console.log(
-    `Using date range ${range.startDateStr} to ${range.endDateStr}${cliArgs.dryRun ? ' [dry-run]' : ''} for repos: ${repoSlugs.map((repo) => repo.key).join(', ')}`,
+    `Using date range ${range.startDateStr} to ${range.endDateStr}${normalizedArgs.dryRun ? ' [dry-run]' : ''} for repos: ${repoSlugs.map((repo) => repo.key).join(', ')}`,
   );
 
   const bitbucketClient = createBitbucketClient();
-  const jiraClient = cliArgs.dryRun ? null : createJiraClient();
+  const jiraClient = normalizedArgs.dryRun ? null : createJiraClient();
 
   const commitSets = [];
   for (const repoConfig of repoSlugs) {
@@ -1013,36 +1037,41 @@ async function main() {
   printMatchedCommits(commits);
   printTimesheet(timesheet);
 
-  const uploads = await uploadToJira(jiraClient, timesheet, { dryRun: cliArgs.dryRun });
-  const filters = {
-    startDate: range.startDateStr,
-    endDate: range.endDateStr,
-    dryRun: cliArgs.dryRun,
-    repos: repoSlugs.map((repo) => repo.key),
-    branches: getConfiguredBranches(),
-    branchPatterns: getConfiguredBranchPatterns(),
-    maxBranches: getConfiguredMaxBranches(),
-    authorEmails: getConfiguredAuthorEmails(),
-  };
-
-  await writeCommitsOutput({
-    generatedAt: new Date().toISOString(),
-    filters,
-    commitSummary,
-    matchedCommits,
-  });
-
-  await writeOutput({
-    generatedAt: new Date().toISOString(),
-    filters,
+  const uploads = await uploadToJira(jiraClient, timesheet, { dryRun: normalizedArgs.dryRun });
+  const generatedAt = new Date().toISOString();
+  const result = {
+    generatedAt,
+    filters: buildFilters(range, normalizedArgs, repoSlugs),
     commitSummary,
     matchedCommits,
     timesheet,
     uploads,
-  });
+  };
+
+  if (options.persistOutput) {
+    await writeCommitsOutput({
+      generatedAt,
+      filters: result.filters,
+      commitSummary,
+      matchedCommits,
+    });
+
+    await writeOutput(result);
+  }
+
+  return result;
 }
 
-main().catch((error) => {
-  console.error(`Fatal error: ${getErrorMessage(error)}`);
-  process.exitCode = 1;
-});
+module.exports = {
+  getErrorMessage,
+  parseArgs,
+  resolveDateRange,
+  runGenerator,
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`Fatal error: ${getErrorMessage(error)}`);
+    process.exitCode = 1;
+  });
+}
