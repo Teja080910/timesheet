@@ -768,10 +768,10 @@ function extractJiraCommentText(comment) {
   return parts.join(' ').trim();
 }
 
-function hasMatchingWorklog(worklogs, entry) {
-  return (worklogs || []).some((worklog) => {
+function findMatchingWorklog(worklogs, entry) {
+  return (worklogs || []).find((worklog) => {
     if (typeof worklog.started !== 'string' || !worklog.started.startsWith(entry.date)) {
-      return false;
+      return null;
     }
 
     const commentText = extractJiraCommentText(worklog.comment);
@@ -844,14 +844,29 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
       try {
         const existingWorklogs = await fetchExistingWorklogs(jiraClient, issueKey);
-        if (hasMatchingWorklog(existingWorklogs, entry)) {
-          console.log(`[SKIP] ${day.date} ${issueKey} ${entry.commitHash.slice(0, 8)} already has a matching worklog.`);
+        const matchingWorklog = findMatchingWorklog(existingWorklogs, entry);
+        if (matchingWorklog) {
+          await retry(
+            () => jiraClient.put(
+              `${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog/${encodeURIComponent(matchingWorklog.id)}`,
+              {
+                started: getStartedTimestamp(day.date, entry.worklogIndex),
+                timeSpentSeconds: entry.secondsSpent,
+                comment: normalizeJiraComment(comment),
+              },
+            ),
+            3,
+            `Worklog update for ${issueKey} on ${day.date}`,
+          );
+
+          console.log(`[UPDATED] ${day.date} ${issueKey} ${entry.commitHash.slice(0, 8)} (${entry.hours}h).`);
           results.push({
             date: day.date,
             ticketId: issueKey,
-            status: 'skipped-duplicate',
+            status: 'updated',
             hours: entry.hours,
             commitHash: entry.commitHash,
+            worklogId: matchingWorklog.id,
           });
           continue;
         }
