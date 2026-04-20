@@ -5,6 +5,7 @@
   "main": "generate-timesheet.js",
   "scripts": {
     "start": "node generate-timesheet.js",
+    "cleanup:duplicates": "node cleanup-jira-duplicates.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",

@@ -10,15 +10,18 @@ const axios = require('axios');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
-const WORKDAY_TOTAL_HOURS = 8;
+const MIN_WORKDAY_MINUTES = 8 * 60;
+const MAX_WORKDAY_MINUTES = 10 * 60;
+const DAILY_RANDOM_STEP_MINUTES = 5;
 const FIXED_DAILY_TICKET = 'PF-6863';
-const FIXED_SLOT_HOURS = 0.5;
-const FIRST_HALF_HOURS = 3;
-const SECOND_HALF_HOURS = 5;
-const FIRST_HALF_WORK_HOURS = FIRST_HALF_HOURS - FIXED_SLOT_HOURS;
-const SECOND_HALF_WORK_HOURS = SECOND_HALF_HOURS - FIXED_SLOT_HOURS;
+const FIXED_SLOT_MINUTES = 30;
+const FIRST_HALF_MINUTES = 3 * 60;
+const SECOND_HALF_MINUTES = 5 * 60;
+const FIRST_HALF_WORK_MINUTES = FIRST_HALF_MINUTES - FIXED_SLOT_MINUTES;
+const SECOND_HALF_WORK_MINUTES = SECOND_HALF_MINUTES - FIXED_SLOT_MINUTES;
 const FIRST_HALF_START_MINUTES = 9 * 60 + 30;
 const SECOND_HALF_START_MINUTES = 14 * 60 + 30;
+const SLOT_MINUTES = 5;
 const OUTPUT_FILE = path.join(process.cwd(), 'timesheet.json');
 const COMMITS_OUTPUT_FILE = path.join(process.cwd(), 'commits-today.json');
 
@@ -642,10 +645,10 @@ function groupCommits(commits) {
   return grouped;
 }
 
-function distributeTenths(totalTenths, weights) {
-  const exactAllocations = weights.map((weight) => weight * totalTenths);
+function distributeUnits(totalUnits, weights) {
+  const exactAllocations = weights.map((weight) => weight * totalUnits);
   const floorAllocations = exactAllocations.map((value) => Math.floor(value));
-  let remaining = totalTenths - floorAllocations.reduce((sum, value) => sum + value, 0);
+  let remaining = totalUnits - floorAllocations.reduce((sum, value) => sum + value, 0);
 
   const byRemainder = exactAllocations
     .map((value, index) => ({ index, remainder: value - floorAllocations[index] }))
@@ -669,8 +672,65 @@ function distributeTenths(totalTenths, weights) {
   return floorAllocations;
 }
 
+function hashString(value) {
+  let hash = 2166136261;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+function getDeterministicInt(seed, maxExclusive) {
+  if (maxExclusive <= 0) {
+    return 0;
+  }
+
+  return hashString(seed) % maxExclusive;
+}
+
+function minutesToHours(minutes) {
+  return Number((minutes / 60).toFixed(2));
+}
+
+function buildDailyTargetMinutes(dates) {
+  if (dates.length === 0) {
+    return new Map();
+  }
+
+  const targets = new Map();
+  const guaranteedEightHourIndex = getDeterministicInt(dates.join('|'), dates.length);
+
+  for (let index = 0; index < dates.length; index += 1) {
+    const date = dates[index];
+    if (index === guaranteedEightHourIndex) {
+      targets.set(date, MIN_WORKDAY_MINUTES);
+      continue;
+    }
+
+    targets.set(
+      date,
+      (MIN_WORKDAY_MINUTES + DAILY_RANDOM_STEP_MINUTES)
+        + (getDeterministicInt(
+          `${date}:daily-total`,
+          Math.floor((MAX_WORKDAY_MINUTES - (MIN_WORKDAY_MINUTES + DAILY_RANDOM_STEP_MINUTES)) / DAILY_RANDOM_STEP_MINUTES) + 1,
+        ) * DAILY_RANDOM_STEP_MINUTES),
+    );
+  }
+
+  return targets;
+}
+
+function getDeterministicFixedSlotStart(seed, halfStartMinutes, halfDurationMinutes) {
+  const availableOffsets = ((halfDurationMinutes - FIXED_SLOT_MINUTES) / SLOT_MINUTES) + 1;
+  return halfStartMinutes + (getDeterministicInt(seed, availableOffsets) * SLOT_MINUTES);
+}
+
 function generateHours(groupedCommits) {
   const dates = Array.from(groupedCommits.keys()).sort();
+  const dailyTargetMinutes = buildDailyTargetMinutes(dates);
   const timesheet = [];
 
   for (const date of dates) {
@@ -682,32 +742,35 @@ function generateHours(groupedCommits) {
     }));
 
     const totalCommits = entries.reduce((sum, entry) => sum + entry.commitCount, 0);
-    const dailyTenths = Math.round(WORKDAY_TOTAL_HOURS * 10);
-    const fixedTenths = Math.round(FIXED_SLOT_HOURS * 10) * 2;
-    const commitTenthsAvailable = dailyTenths - fixedTenths;
+    const dailyMinutes = dailyTargetMinutes.get(date) || MIN_WORKDAY_MINUTES;
+    const commitMinutesAvailable = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
+    const commitUnitsAvailable = commitMinutesAvailable / SLOT_MINUTES;
     const weights = entries.map((entry) => entry.commitCount / totalCommits);
-    const allocations = distributeTenths(commitTenthsAvailable, weights);
+    const allocations = distributeUnits(commitUnitsAvailable, weights);
 
     const dayEntries = [];
 
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
-      const ticketTenths = allocations[index];
+      const ticketUnits = allocations[index];
       const commitWeights = entry.commits.map(() => 1 / entry.commits.length);
-      const commitAllocations = distributeTenths(ticketTenths, commitWeights);
+      const commitAllocations = distributeUnits(ticketUnits, commitWeights);
 
       for (let commitIndex = 0; commitIndex < entry.commits.length; commitIndex += 1) {
         const commit = entry.commits[commitIndex];
-        const commitTenths = commitAllocations[commitIndex];
-        if (commitTenths <= 0) {
+        const commitUnits = commitAllocations[commitIndex];
+        if (commitUnits <= 0) {
           continue;
         }
+
+        const durationMinutes = commitUnits * SLOT_MINUTES;
 
         dayEntries.push({
           date,
           ticketId: entry.ticketId,
-          hours: Number((commitTenths / 10).toFixed(1)),
-          secondsSpent: commitTenths * 360,
+          hours: minutesToHours(durationMinutes),
+          secondsSpent: durationMinutes * 60,
+          durationMinutes,
           commitCount: 1,
           repos: [commit.repo],
           commitHashes: [commit.hash],
@@ -719,8 +782,9 @@ function generateHours(groupedCommits) {
       }
     }
 
-    const scheduledCommitEntries = scheduleEntriesAcrossOfficeHalves(dayEntries);
-    const fixedEntries = buildFixedTicketEntries(date);
+    const dailySchedule = buildDailySchedule(date, dayEntries, dailyMinutes);
+    const scheduledCommitEntries = dailySchedule.commitEntries;
+    const fixedEntries = dailySchedule.fixedEntries;
     const allEntries = [...fixedEntries, ...scheduledCommitEntries].sort((left, right) => {
       if (left.startMinutes !== right.startMinutes) {
         return left.startMinutes - right.startMinutes;
@@ -729,14 +793,16 @@ function generateHours(groupedCommits) {
       return left.ticketId.localeCompare(right.ticketId);
     });
 
-    const actualDailyTotal = allEntries.reduce((sum, entry) => sum + entry.hours, 0);
-    if (actualDailyTotal !== WORKDAY_TOTAL_HOURS) {
-      throw new Error(`Generated daily total must equal ${WORKDAY_TOTAL_HOURS} hours for ${date}, received ${actualDailyTotal} hours.`);
+    const actualDailySeconds = allEntries.reduce((sum, entry) => sum + entry.secondsSpent, 0);
+    const expectedDailySeconds = dailyMinutes * 60;
+    if (actualDailySeconds !== expectedDailySeconds) {
+      const actualDailyTotal = Number((actualDailySeconds / 3600).toFixed(4));
+      throw new Error(`Generated daily total must equal ${minutesToHours(dailyMinutes)} hours for ${date}, received ${actualDailyTotal} hours.`);
     }
 
     timesheet.push({
       date,
-      totalHours: Number(actualDailyTotal.toFixed(1)),
+      totalHours: minutesToHours(dailyMinutes),
       entries: allEntries,
     });
   }
@@ -744,100 +810,132 @@ function generateHours(groupedCommits) {
   return timesheet;
 }
 
-function scheduleEntriesAcrossOfficeHalves(entries) {
-  const totalTenths = entries.reduce((sum, entry) => sum + Math.round(entry.hours * 10), 0);
-  const firstHalfTenths = Math.round(FIRST_HALF_WORK_HOURS * 10);
-  const secondHalfTenths = Math.round(SECOND_HALF_WORK_HOURS * 10);
-
-  if (totalTenths !== firstHalfTenths + secondHalfTenths) {
-    throw new Error(`Commit allocations must equal ${WORKDAY_TOTAL_HOURS - (FIXED_SLOT_HOURS * 2)} hours per day.`);
+function buildDailySchedule(date, entries, dailyMinutes) {
+  const totalCommitMinutes = entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
+  const expectedCommitMinutes = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
+  if (totalCommitMinutes !== expectedCommitMinutes) {
+    throw new Error(`Commit allocations must equal ${minutesToHours(expectedCommitMinutes)} hours per day.`);
   }
 
-  const weightedTenths = entries.map((entry) => Math.round(entry.hours * 10));
-  const firstHalfAllocations = distributeTenths(
-    firstHalfTenths,
-    weightedTenths.map((tenths) => tenths / totalTenths),
+  const overtimeMinutes = Math.max(dailyMinutes - MIN_WORKDAY_MINUTES, 0);
+  const segmentDurations = [
+    FIRST_HALF_WORK_MINUTES,
+    SECOND_HALF_WORK_MINUTES,
+    overtimeMinutes,
+  ];
+  const commitUnits = entries.map((entry) => entry.durationMinutes / SLOT_MINUTES);
+  const totalCommitUnits = commitUnits.reduce((sum, value) => sum + value, 0);
+  const segmentUnitCaps = segmentDurations.map((minutes) => minutes / SLOT_MINUTES);
+  const firstHalfAllocations = distributeUnits(
+    segmentUnitCaps[0],
+    commitUnits.map((value) => value / totalCommitUnits),
   );
-  const secondHalfAllocations = weightedTenths.map((tenths, index) => tenths - firstHalfAllocations[index]);
+  const remainingAfterFirst = commitUnits.map((value, index) => value - firstHalfAllocations[index]);
+  const secondHalfAllocations = distributeUnits(
+    segmentUnitCaps[1],
+    remainingAfterFirst.map((value) => value / remainingAfterFirst.reduce((sum, item) => sum + item, 0)),
+  );
+  const overtimeAllocations = remainingAfterFirst.map((value, index) => value - secondHalfAllocations[index]);
 
-  const scheduled = [];
-  let firstHalfCursor = FIRST_HALF_START_MINUTES + Math.round(FIXED_SLOT_HOURS * 60);
-  let secondHalfCursor = SECOND_HALF_START_MINUTES + Math.round(FIXED_SLOT_HOURS * 60);
-
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index];
-    const firstHalfEntryTenths = firstHalfAllocations[index];
-    const secondHalfEntryTenths = secondHalfAllocations[index];
-
-    if (firstHalfEntryTenths > 0) {
-      scheduled.push({
-        ...entry,
-        hours: Number((firstHalfEntryTenths / 10).toFixed(1)),
-        secondsSpent: firstHalfEntryTenths * 360,
-        segment: 'first-half',
-        startMinutes: firstHalfCursor,
-        matchingKey: `${entry.matchingKey}-first-half`,
-      });
-      firstHalfCursor += firstHalfEntryTenths * 6;
-    }
-
-    if (secondHalfEntryTenths > 0) {
-      scheduled.push({
-        ...entry,
-        hours: Number((secondHalfEntryTenths / 10).toFixed(1)),
-        secondsSpent: secondHalfEntryTenths * 360,
-        segment: 'second-half',
-        startMinutes: secondHalfCursor,
-        matchingKey: `${entry.matchingKey}-second-half`,
-      });
-      secondHalfCursor += secondHalfEntryTenths * 6;
-    }
-  }
-
-  if (firstHalfCursor > FIRST_HALF_START_MINUTES + (FIRST_HALF_HOURS * 60)) {
-    throw new Error('Generated first-half schedule exceeded 12:30.');
-  }
-
-  if (secondHalfCursor > SECOND_HALF_START_MINUTES + (SECOND_HALF_HOURS * 60)) {
-    throw new Error('Generated second-half schedule exceeded 19:30.');
-  }
-
-  return scheduled;
-}
-
-function buildFixedTicketEntries(date) {
-  return [
+  const firstHalfFixedStart = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
+  const secondHalfFixedStart = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
+  const fixedEntries = [
     {
       date,
       ticketId: FIXED_DAILY_TICKET,
-      hours: FIXED_SLOT_HOURS,
-      secondsSpent: Math.round(FIXED_SLOT_HOURS * 3600),
+      hours: minutesToHours(FIXED_SLOT_MINUTES),
+      secondsSpent: FIXED_SLOT_MINUTES * 60,
+      durationMinutes: FIXED_SLOT_MINUTES,
       repos: [],
       commitHashes: [],
       commitMessages: [],
       commitHash: 'FIXED-AM',
       commitMessage: 'Daily first-half fixed allocation',
       segment: 'first-half-fixed',
-      startMinutes: FIRST_HALF_START_MINUTES,
+      startMinutes: firstHalfFixedStart,
       matchingKey: `${FIXED_DAILY_TICKET}-first-half-fixed`,
       isFixedAllocation: true,
     },
     {
       date,
       ticketId: FIXED_DAILY_TICKET,
-      hours: FIXED_SLOT_HOURS,
-      secondsSpent: Math.round(FIXED_SLOT_HOURS * 3600),
+      hours: minutesToHours(FIXED_SLOT_MINUTES),
+      secondsSpent: FIXED_SLOT_MINUTES * 60,
+      durationMinutes: FIXED_SLOT_MINUTES,
       repos: [],
       commitHashes: [],
       commitMessages: [],
       commitHash: 'FIXED-PM',
       commitMessage: 'Daily second-half fixed allocation',
       segment: 'second-half-fixed',
-      startMinutes: SECOND_HALF_START_MINUTES,
+      startMinutes: secondHalfFixedStart,
       matchingKey: `${FIXED_DAILY_TICKET}-second-half-fixed`,
       isFixedAllocation: true,
     },
   ];
+
+  const commitEntries = [
+    ...scheduleHalfEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES, firstHalfFixedStart, 'first-half'),
+    ...scheduleHalfEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES, secondHalfFixedStart, 'second-half'),
+    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night'),
+  ];
+
+  return {
+    fixedEntries,
+    commitEntries,
+  };
+}
+
+function scheduleHalfEntries(entries, allocations, segmentStartMinutes, segmentDurationMinutes, fixedSlotStartMinutes, segmentName) {
+  const totalUnits = allocations.reduce((sum, value) => sum + value, 0);
+  if (totalUnits === 0) {
+    return [];
+  }
+
+  const beforeFixedUnits = (fixedSlotStartMinutes - segmentStartMinutes) / SLOT_MINUTES;
+  const afterFixedUnits = ((segmentStartMinutes + segmentDurationMinutes) - (fixedSlotStartMinutes + FIXED_SLOT_MINUTES)) / SLOT_MINUTES;
+  let remainingBeforeUnits = beforeFixedUnits;
+  const beforeAllocations = allocations.map((value) => {
+    const assigned = Math.min(value, remainingBeforeUnits);
+    remainingBeforeUnits -= assigned;
+    return assigned;
+  });
+  const afterAllocations = allocations.map((value, index) => value - beforeAllocations[index]);
+
+  if (afterAllocations.reduce((sum, value) => sum + value, 0) !== afterFixedUnits) {
+    throw new Error(`Generated ${segmentName} schedule does not fit around fixed ticket placement.`);
+  }
+
+  return [
+    ...schedulePlainSegmentEntries(entries, beforeAllocations, segmentStartMinutes, `${segmentName}-before`),
+    ...schedulePlainSegmentEntries(entries, afterAllocations, fixedSlotStartMinutes + FIXED_SLOT_MINUTES, `${segmentName}-after`),
+  ];
+}
+
+function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName) {
+  const scheduled = [];
+  let cursor = segmentStartMinutes;
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const allocatedUnits = allocations[index];
+    if (allocatedUnits <= 0) {
+      continue;
+    }
+
+    const durationMinutes = allocatedUnits * SLOT_MINUTES;
+    scheduled.push({
+      ...entries[index],
+      hours: minutesToHours(durationMinutes),
+      secondsSpent: durationMinutes * 60,
+      durationMinutes,
+      segment: segmentName,
+      startMinutes: cursor,
+      matchingKey: `${entries[index].matchingKey}-${segmentName}`,
+    });
+    cursor += durationMinutes;
+  }
+
+  return scheduled;
 }
 
 function buildWorklogComment(ticketId, entry) {
@@ -1093,10 +1191,10 @@ function printTimesheet(timesheet) {
   }
 
   for (const day of timesheet) {
-    console.log(`${day.date} - ${day.totalHours.toFixed(1)}h`);
+    console.log(`${day.date} - ${day.totalHours.toFixed(2)}h`);
     for (const entry of day.entries) {
       console.log(
-        `  ${entry.ticketId}: ${entry.hours.toFixed(1)}h (${entry.commitHash.slice(0, 8)}, repos: ${entry.repos.join(', ')})`,
+        `  ${entry.ticketId}: ${entry.hours.toFixed(2)}h (${entry.commitHash.slice(0, 8)}, repos: ${entry.repos.join(', ')})`,
       );
     }
   }
@@ -1172,8 +1270,14 @@ async function runGenerator(cliArgs = {}, options = {}) {
 }
 
 module.exports = {
+  buildWorklogComment,
+  createJiraClient,
+  extractJiraCommentText,
+  fetchExistingWorklogs,
   getErrorMessage,
+  getJiraApiBasePath,
   parseArgs,
+  retry,
   resolveDateRange,
   runGenerator,
 };
