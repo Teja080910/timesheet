@@ -10,9 +10,15 @@ const axios = require('axios');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
-const MAX_DAILY_HOURS = 10;
-const MIN_DAILY_HOURS = 8;
-const DEFAULT_START_HOUR = '09:00:00.000+0530';
+const WORKDAY_TOTAL_HOURS = 8;
+const FIXED_DAILY_TICKET = 'PF-6863';
+const FIXED_SLOT_HOURS = 0.5;
+const FIRST_HALF_HOURS = 3;
+const SECOND_HALF_HOURS = 5;
+const FIRST_HALF_WORK_HOURS = FIRST_HALF_HOURS - FIXED_SLOT_HOURS;
+const SECOND_HALF_WORK_HOURS = SECOND_HALF_HOURS - FIXED_SLOT_HOURS;
+const FIRST_HALF_START_MINUTES = 9 * 60 + 30;
+const SECOND_HALF_START_MINUTES = 14 * 60 + 30;
 const OUTPUT_FILE = path.join(process.cwd(), 'timesheet.json');
 const COMMITS_OUTPUT_FILE = path.join(process.cwd(), 'commits-today.json');
 
@@ -246,6 +252,19 @@ function getJiraApiVersion() {
 
 function getJiraApiBasePath() {
   return `/rest/api/${getJiraApiVersion()}`;
+}
+
+function getWorklogTimezoneOffset() {
+  const configured = (process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '').trim();
+  if (!configured) {
+    return '+0000';
+  }
+
+  if (!/^[+-]\d{4}$/.test(configured)) {
+    throw new Error('JIRA_WORKLOG_TIMEZONE_OFFSET must use the format +0000 or +0530.');
+  }
+
+  return configured;
 }
 
 function createJiraClient() {
@@ -623,16 +642,6 @@ function groupCommits(commits) {
   return grouped;
 }
 
-function getRandomDailyHours() {
-  const steps = [];
-  for (let value = MIN_DAILY_HOURS; value <= MAX_DAILY_HOURS; value += 0.5) {
-    steps.push(Number(value.toFixed(1)));
-  }
-
-  const selected = steps[Math.floor(Math.random() * steps.length)];
-  return Number(selected.toFixed(1));
-}
-
 function distributeTenths(totalTenths, weights) {
   const exactAllocations = weights.map((weight) => weight * totalTenths);
   const floorAllocations = exactAllocations.map((value) => Math.floor(value));
@@ -673,13 +682,13 @@ function generateHours(groupedCommits) {
     }));
 
     const totalCommits = entries.reduce((sum, entry) => sum + entry.commitCount, 0);
-    const dailyHours = getRandomDailyHours();
-    const dailyTenths = Math.round(dailyHours * 10);
+    const dailyTenths = Math.round(WORKDAY_TOTAL_HOURS * 10);
+    const fixedTenths = Math.round(FIXED_SLOT_HOURS * 10) * 2;
+    const commitTenthsAvailable = dailyTenths - fixedTenths;
     const weights = entries.map((entry) => entry.commitCount / totalCommits);
-    const allocations = distributeTenths(dailyTenths, weights);
+    const allocations = distributeTenths(commitTenthsAvailable, weights);
 
     const dayEntries = [];
-    let worklogIndex = 0;
 
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
@@ -705,46 +714,146 @@ function generateHours(groupedCommits) {
           commitMessages: commit.message ? [commit.message] : [],
           commitHash: commit.hash,
           commitMessage: commit.message || '',
-          worklogIndex,
+          matchingKey: commit.hash.slice(0, 8),
         });
-
-        worklogIndex += 1;
       }
     }
 
-    const actualDailyTotal = dayEntries.reduce((sum, entry) => sum + entry.hours, 0);
-    if (actualDailyTotal > MAX_DAILY_HOURS) {
-      throw new Error(`Generated daily total exceeded ${MAX_DAILY_HOURS} hours for ${date}.`);
+    const scheduledCommitEntries = scheduleEntriesAcrossOfficeHalves(dayEntries);
+    const fixedEntries = buildFixedTicketEntries(date);
+    const allEntries = [...fixedEntries, ...scheduledCommitEntries].sort((left, right) => {
+      if (left.startMinutes !== right.startMinutes) {
+        return left.startMinutes - right.startMinutes;
+      }
+
+      return left.ticketId.localeCompare(right.ticketId);
+    });
+
+    const actualDailyTotal = allEntries.reduce((sum, entry) => sum + entry.hours, 0);
+    if (actualDailyTotal !== WORKDAY_TOTAL_HOURS) {
+      throw new Error(`Generated daily total must equal ${WORKDAY_TOTAL_HOURS} hours for ${date}, received ${actualDailyTotal} hours.`);
     }
 
     timesheet.push({
       date,
       totalHours: Number(actualDailyTotal.toFixed(1)),
-      entries: dayEntries,
+      entries: allEntries,
     });
   }
 
   return timesheet;
 }
 
-function buildWorklogComment(ticketId, entry) {
-  const normalizedMessage = (entry.commitMessage || '').replace(/\s+/g, ' ').trim();
-  const summary = normalizedMessage ? ` Commit: ${normalizedMessage}` : '';
-  return `Worked on ${ticketId} (development, fixes, improvements). Commit ${entry.commitHash.slice(0, 8)}.${summary}`;
+function scheduleEntriesAcrossOfficeHalves(entries) {
+  const totalTenths = entries.reduce((sum, entry) => sum + Math.round(entry.hours * 10), 0);
+  const firstHalfTenths = Math.round(FIRST_HALF_WORK_HOURS * 10);
+  const secondHalfTenths = Math.round(SECOND_HALF_WORK_HOURS * 10);
+
+  if (totalTenths !== firstHalfTenths + secondHalfTenths) {
+    throw new Error(`Commit allocations must equal ${WORKDAY_TOTAL_HOURS - (FIXED_SLOT_HOURS * 2)} hours per day.`);
+  }
+
+  const weightedTenths = entries.map((entry) => Math.round(entry.hours * 10));
+  const firstHalfAllocations = distributeTenths(
+    firstHalfTenths,
+    weightedTenths.map((tenths) => tenths / totalTenths),
+  );
+  const secondHalfAllocations = weightedTenths.map((tenths, index) => tenths - firstHalfAllocations[index]);
+
+  const scheduled = [];
+  let firstHalfCursor = FIRST_HALF_START_MINUTES + Math.round(FIXED_SLOT_HOURS * 60);
+  let secondHalfCursor = SECOND_HALF_START_MINUTES + Math.round(FIXED_SLOT_HOURS * 60);
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const firstHalfEntryTenths = firstHalfAllocations[index];
+    const secondHalfEntryTenths = secondHalfAllocations[index];
+
+    if (firstHalfEntryTenths > 0) {
+      scheduled.push({
+        ...entry,
+        hours: Number((firstHalfEntryTenths / 10).toFixed(1)),
+        secondsSpent: firstHalfEntryTenths * 360,
+        segment: 'first-half',
+        startMinutes: firstHalfCursor,
+        matchingKey: `${entry.matchingKey}-first-half`,
+      });
+      firstHalfCursor += firstHalfEntryTenths * 6;
+    }
+
+    if (secondHalfEntryTenths > 0) {
+      scheduled.push({
+        ...entry,
+        hours: Number((secondHalfEntryTenths / 10).toFixed(1)),
+        secondsSpent: secondHalfEntryTenths * 360,
+        segment: 'second-half',
+        startMinutes: secondHalfCursor,
+        matchingKey: `${entry.matchingKey}-second-half`,
+      });
+      secondHalfCursor += secondHalfEntryTenths * 6;
+    }
+  }
+
+  if (firstHalfCursor > FIRST_HALF_START_MINUTES + (FIRST_HALF_HOURS * 60)) {
+    throw new Error('Generated first-half schedule exceeded 12:30.');
+  }
+
+  if (secondHalfCursor > SECOND_HALF_START_MINUTES + (SECOND_HALF_HOURS * 60)) {
+    throw new Error('Generated second-half schedule exceeded 19:30.');
+  }
+
+  return scheduled;
 }
 
-function getStartedTimestamp(date, worklogIndex = 0) {
-  const baseDate = new Date(`${date}T09:00:00.000+05:30`);
-  baseDate.setMinutes(baseDate.getMinutes() + worklogIndex);
+function buildFixedTicketEntries(date) {
+  return [
+    {
+      date,
+      ticketId: FIXED_DAILY_TICKET,
+      hours: FIXED_SLOT_HOURS,
+      secondsSpent: Math.round(FIXED_SLOT_HOURS * 3600),
+      repos: [],
+      commitHashes: [],
+      commitMessages: [],
+      commitHash: 'FIXED-AM',
+      commitMessage: 'Daily first-half fixed allocation',
+      segment: 'first-half-fixed',
+      startMinutes: FIRST_HALF_START_MINUTES,
+      matchingKey: `${FIXED_DAILY_TICKET}-first-half-fixed`,
+      isFixedAllocation: true,
+    },
+    {
+      date,
+      ticketId: FIXED_DAILY_TICKET,
+      hours: FIXED_SLOT_HOURS,
+      secondsSpent: Math.round(FIXED_SLOT_HOURS * 3600),
+      repos: [],
+      commitHashes: [],
+      commitMessages: [],
+      commitHash: 'FIXED-PM',
+      commitMessage: 'Daily second-half fixed allocation',
+      segment: 'second-half-fixed',
+      startMinutes: SECOND_HALF_START_MINUTES,
+      matchingKey: `${FIXED_DAILY_TICKET}-second-half-fixed`,
+      isFixedAllocation: true,
+    },
+  ];
+}
 
-  const year = baseDate.getFullYear();
-  const month = String(baseDate.getMonth() + 1).padStart(2, '0');
-  const day = String(baseDate.getDate()).padStart(2, '0');
-  const hours = String(baseDate.getHours()).padStart(2, '0');
-  const minutes = String(baseDate.getMinutes()).padStart(2, '0');
-  const seconds = String(baseDate.getSeconds()).padStart(2, '0');
+function buildWorklogComment(ticketId, entry) {
+  if (entry.isFixedAllocation) {
+    return `Worked on ${ticketId}. Daily fixed allocation slot [${entry.matchingKey}].`;
+  }
 
-  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.000+0530`;
+  const normalizedMessage = (entry.commitMessage || '').replace(/\s+/g, ' ').trim();
+  const summary = normalizedMessage ? ` Commit: ${normalizedMessage}` : '';
+  return `Worked on ${ticketId} (development, fixes, improvements). Entry [${entry.matchingKey}]. Commit ${entry.commitHash.slice(0, 8)}.${summary}`;
+}
+
+function getStartedTimestamp(date, startMinutes = FIRST_HALF_START_MINUTES) {
+  const hours = String(Math.floor(startMinutes / 60)).padStart(2, '0');
+  const minutes = String(startMinutes % 60).padStart(2, '0');
+  return `${date}T${hours}:${minutes}:00.000${getWorklogTimezoneOffset()}`;
 }
 
 function extractJiraCommentText(comment) {
@@ -775,7 +884,7 @@ function findMatchingWorklog(worklogs, entry) {
     }
 
     const commentText = extractJiraCommentText(worklog.comment);
-    return commentText.includes(entry.commitHash.slice(0, 8));
+    return commentText.includes(`[${entry.matchingKey}]`);
   });
 }
 
@@ -831,7 +940,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
       const comment = buildWorklogComment(issueKey, entry);
 
       if (options.dryRun) {
-        console.log(`[DRY RUN] ${day.date} ${issueKey} ${entry.hours}h ${entry.commitHash.slice(0, 8)}`);
+        console.log(`[DRY RUN] ${day.date} ${issueKey} ${entry.hours}h ${entry.commitHash.slice(0, 8)} @ ${getStartedTimestamp(day.date, entry.startMinutes)}`);
         results.push({
           date: day.date,
           ticketId: issueKey,
@@ -850,7 +959,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
             () => jiraClient.put(
               `${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog/${encodeURIComponent(matchingWorklog.id)}`,
               {
-                started: getStartedTimestamp(day.date, entry.worklogIndex),
+                started: getStartedTimestamp(day.date, entry.startMinutes),
                 timeSpentSeconds: entry.secondsSpent,
                 comment: normalizeJiraComment(comment),
               },
@@ -873,7 +982,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
         await retry(
           () => jiraClient.post(`${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog`, {
-            started: getStartedTimestamp(day.date, entry.worklogIndex),
+            started: getStartedTimestamp(day.date, entry.startMinutes),
             timeSpentSeconds: entry.secondsSpent,
             comment: normalizeJiraComment(comment),
           }),

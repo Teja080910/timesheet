@@ -3,3 +3,4 @@ node_modules
 timesheet*
 commits-today*
 !api/timesheet.js
+.codex
