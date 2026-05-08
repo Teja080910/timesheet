@@ -3,5 +3,10 @@
     "api/**/*.js": {
       "maxDuration": 60
     }
+  },
+  "env": {
+    "GOOGLE_SERVICE_ACCOUNT_EMAIL": "@google-service-account-email",
+    "GOOGLE_SERVICE_ACCOUNT_KEY": "@google-service-account-key",
+    "GOOGLE_CALENDAR_ID": "@google-calendar-id"
   }
 }

@@ -26,6 +26,37 @@ This project can now run in two modes:
 
 `TIMESHEET_API_TOKEN` is required by the Vercel API route. Requests without it are rejected.
 
+### Google Calendar (optional)
+
+You can also pull meetings from Google Calendar. The events will appear as time entries
+in the timesheet (marked as `[MEETING]`), and commit-based allocations adjust automatically.
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Service account email from Google Cloud |
+| `GOOGLE_SERVICE_ACCOUNT_KEY` | Private key of the service account |
+| `GOOGLE_CALENDAR_ID` | Calendar ID to fetch events from |
+| `GOOGLE_CALENDAR_MAX_EVENTS` | Max events per fetch (default: `100`) |
+| `GOOGLE_CALENDAR_EVENT_LABEL` | Label prefix (default: `Meeting`) |
+
+**Setup steps:**
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) → **APIs & Services**
+2. Enable the **Google Calendar API**
+3. Create a **Service Account** → download the JSON key
+4. Copy the `client_email` → `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+5. Copy the `private_key` → `GOOGLE_SERVICE_ACCOUNT_KEY`
+6. Share your Google Calendar with the service account email (at least **View** permission)
+7. Find your Calendar ID in Google Calendar settings → **Integrate calendar**
+
+Calendar events that contain a ticket ID (e.g. `PF-12345`) in the title will be
+tagged with that ticket. All other events use `MEETING` as the ticket identifier.
+Calendar entries are **not** uploaded to Jira — they appear in the timesheet output
+for your reference.
+
+**Note on timezone:** Timesheet works in UTC. Calendar event times are converted
+to UTC automatically, matching the existing `JIRA_WORKLOG_TIMEZONE_OFFSET` behaviour.
+
 ## API usage
 
 Endpoint:
@@ -94,8 +125,7 @@ Generated Jira worklogs now follow your office schedule with randomized placemen
 - First half: `09:30` to `12:30`
 - Second half: `14:30` to `19:30`
 - Fixed daily allocation: `PF-6863` for `0.5h` once in the first half and `0.5h` once in the second half
-- Daily total hours: random between `8.00h` and `10.00h`
-- At least one generated day stays exactly `8.00h`
+- Daily total hours: fixed at `8.00h` for every day
 - Extra time above `8.00h` is scheduled after `19:30` as evening work
 - The schedule is deterministic per date, so rerunning the same date range updates the same Jira worklogs instead of creating duplicates
 

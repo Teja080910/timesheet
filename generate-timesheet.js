@@ -7,12 +7,11 @@ require('dotenv').config();
 const fs = require('fs/promises');
 const path = require('path');
 const axios = require('axios');
+const { fetchCalendarEvents } = require('./google-calendar');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
 const MIN_WORKDAY_MINUTES = 8 * 60;
-const MAX_WORKDAY_MINUTES = 10 * 60;
-const DAILY_RANDOM_STEP_MINUTES = 5;
 const FIXED_DAILY_TICKET = 'PF-6863';
 const FIXED_SLOT_MINUTES = 30;
 const FIRST_HALF_MINUTES = 3 * 60;
@@ -701,23 +700,8 @@ function buildDailyTargetMinutes(dates) {
   }
 
   const targets = new Map();
-  const guaranteedEightHourIndex = getDeterministicInt(dates.join('|'), dates.length);
-
-  for (let index = 0; index < dates.length; index += 1) {
-    const date = dates[index];
-    if (index === guaranteedEightHourIndex) {
-      targets.set(date, MIN_WORKDAY_MINUTES);
-      continue;
-    }
-
-    targets.set(
-      date,
-      (MIN_WORKDAY_MINUTES + DAILY_RANDOM_STEP_MINUTES)
-        + (getDeterministicInt(
-          `${date}:daily-total`,
-          Math.floor((MAX_WORKDAY_MINUTES - (MIN_WORKDAY_MINUTES + DAILY_RANDOM_STEP_MINUTES)) / DAILY_RANDOM_STEP_MINUTES) + 1,
-        ) * DAILY_RANDOM_STEP_MINUTES),
-    );
+  for (const date of dates) {
+    targets.set(date, MIN_WORKDAY_MINUTES);
   }
 
   return targets;
@@ -728,12 +712,24 @@ function getDeterministicFixedSlotStart(seed, halfStartMinutes, halfDurationMinu
   return halfStartMinutes + (getDeterministicInt(seed, availableOffsets) * SLOT_MINUTES);
 }
 
-function generateHours(groupedCommits) {
+function generateHours(groupedCommits, calendarEvents = []) {
+  // Build calendar events lookup by date
+  const eventsByDate = new Map();
+  for (const event of calendarEvents) {
+    if (!eventsByDate.has(event.date)) {
+      eventsByDate.set(event.date, []);
+    }
+    eventsByDate.get(event.date).push(event);
+  }
+
   const dates = Array.from(groupedCommits.keys()).sort();
   const dailyTargetMinutes = buildDailyTargetMinutes(dates);
   const timesheet = [];
 
   for (const date of dates) {
+    const dayEvents = eventsByDate.get(date) || [];
+    const meetingMinutes = dayEvents.reduce((sum, e) => sum + e.durationMinutes, 0);
+
     const tickets = groupedCommits.get(date);
     const entries = Array.from(tickets.entries()).map(([ticketId, commits]) => ({
       ticketId,
@@ -742,9 +738,17 @@ function generateHours(groupedCommits) {
     }));
 
     const totalCommits = entries.reduce((sum, entry) => sum + entry.commitCount, 0);
-    const dailyMinutes = dailyTargetMinutes.get(date) || MIN_WORKDAY_MINUTES;
-    const commitMinutesAvailable = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
-    const commitUnitsAvailable = commitMinutesAvailable / SLOT_MINUTES;
+
+    // Adjust daily minutes to account for calendar meetings
+    const baseDailyMinutes = dailyTargetMinutes.get(date) || MIN_WORKDAY_MINUTES;
+    const adjustedDailyMinutes = Math.max(baseDailyMinutes - meetingMinutes, 0);
+    const commitMinutesAvailable = adjustedDailyMinutes - (FIXED_SLOT_MINUTES * 2);
+
+    if (commitMinutesAvailable < 0) {
+      console.warn(`  ${date}: Meetings (${meetingMinutes}min) exceed available time, commits have no time budget.`);
+    }
+
+    const commitUnitsAvailable = Math.max(commitMinutesAvailable / SLOT_MINUTES, 0);
     const weights = entries.map((entry) => entry.commitCount / totalCommits);
     const allocations = distributeUnits(commitUnitsAvailable, weights);
 
@@ -782,27 +786,64 @@ function generateHours(groupedCommits) {
       }
     }
 
-    const dailySchedule = buildDailySchedule(date, dayEntries, dailyMinutes);
+    const dailySchedule = buildDailySchedule(date, dayEntries, adjustedDailyMinutes);
     const scheduledCommitEntries = dailySchedule.commitEntries;
     const fixedEntries = dailySchedule.fixedEntries;
-    const allEntries = [...fixedEntries, ...scheduledCommitEntries].sort((left, right) => {
+
+    // Build calendar event entries
+    const calendarEntries = dayEvents.map((event) => {
+      const startMinutes = event.startTime.getUTCHours() * 60 + event.startTime.getUTCMinutes();
+      const label = (process.env.GOOGLE_CALENDAR_EVENT_LABEL || 'Meeting').trim();
+      const ticketId = event.ticketId || 'MEETING';
+      const description = event.ticketId
+        ? `#${event.ticketId} ${event.summary}`
+        : event.summary;
+
+      return {
+        date,
+        ticketId,
+        hours: minutesToHours(event.durationMinutes),
+        secondsSpent: event.durationMinutes * 60,
+        durationMinutes: event.durationMinutes,
+        repos: [],
+        commitHashes: [],
+        commitMessages: [],
+        commitHash: `CAL-${event.id ? event.id.slice(0, 7) : 'unknown'}`,
+        commitMessage: description,
+        matchingKey: `calendar-${event.id || event.summary.slice(0, 20)}`,
+        startMinutes,
+        isCalendarEvent: true,
+        htmlLink: event.htmlLink,
+        summary: event.summary,
+      };
+    });
+
+    // Combine and sort all entries by start time
+    const allEntries = [...fixedEntries, ...scheduledCommitEntries, ...calendarEntries].sort((left, right) => {
       if (left.startMinutes !== right.startMinutes) {
         return left.startMinutes - right.startMinutes;
       }
+
+      // Fixed entries come first, then commits, then calendar
+      if (left.isFixedAllocation && !right.isFixedAllocation) return -1;
+      if (!left.isFixedAllocation && right.isFixedAllocation) return 1;
+      if (left.isCalendarEvent && !right.isCalendarEvent) return 1;
+      if (!left.isCalendarEvent && right.isCalendarEvent) return -1;
 
       return left.ticketId.localeCompare(right.ticketId);
     });
 
     const actualDailySeconds = allEntries.reduce((sum, entry) => sum + entry.secondsSpent, 0);
-    const expectedDailySeconds = dailyMinutes * 60;
+    const expectedDailySeconds = baseDailyMinutes * 60;
     if (actualDailySeconds !== expectedDailySeconds) {
       const actualDailyTotal = Number((actualDailySeconds / 3600).toFixed(4));
-      throw new Error(`Generated daily total must equal ${minutesToHours(dailyMinutes)} hours for ${date}, received ${actualDailyTotal} hours.`);
+      throw new Error(`Generated daily total must equal ${minutesToHours(baseDailyMinutes)} hours for ${date}, received ${actualDailyTotal} hours.`);
     }
 
     timesheet.push({
       date,
-      totalHours: minutesToHours(dailyMinutes),
+      totalHours: minutesToHours(baseDailyMinutes),
+      meetingMinutes,
       entries: allEntries,
     });
   }
@@ -1034,6 +1075,18 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
   for (const day of timesheet) {
     for (const entry of day.entries) {
+      // Skip calendar events – they are logged for reference, not uploaded as worklogs
+      if (entry.isCalendarEvent) {
+        console.log(`  [SKIP] ${day.date} ${entry.ticketId}: ${entry.commitMessage.slice(0, 60)} (calendar event, not uploaded).`);
+        results.push({
+          date: day.date,
+          ticketId: entry.ticketId,
+          status: 'skipped-calendar',
+          hours: entry.hours,
+        });
+        continue;
+      }
+
       const issueKey = entry.ticketId;
       const comment = buildWorklogComment(issueKey, entry);
 
@@ -1191,11 +1244,22 @@ function printTimesheet(timesheet) {
   }
 
   for (const day of timesheet) {
-    console.log(`${day.date} - ${day.totalHours.toFixed(2)}h`);
+    const meetingNote = day.meetingMinutes > 0 ? ` (${day.meetingMinutes}min meetings)` : '';
+    console.log(`${day.date} - ${day.totalHours.toFixed(2)}h${meetingNote}`);
     for (const entry of day.entries) {
-      console.log(
-        `  ${entry.ticketId}: ${entry.hours.toFixed(2)}h (${entry.commitHash.slice(0, 8)}, repos: ${entry.repos.join(', ')})`,
-      );
+      if (entry.isCalendarEvent) {
+        console.log(
+          `  [MEETING] ${entry.commitMessage.slice(0, 70)}: ${entry.hours.toFixed(2)}h @ ${Math.floor(entry.startMinutes / 60).toString().padStart(2, '0')}:${(entry.startMinutes % 60).toString().padStart(2, '0')}`,
+        );
+      } else if (entry.isFixedAllocation) {
+        console.log(
+          `  ${entry.ticketId}: ${entry.hours.toFixed(2)}h (fixed, ${entry.commitHash})`,
+        );
+      } else {
+        console.log(
+          `  ${entry.ticketId}: ${entry.hours.toFixed(2)}h (${entry.commitHash.slice(0, 8)}, repos: ${entry.repos.join(', ')})`,
+        );
+      }
     }
   }
 }
@@ -1235,13 +1299,25 @@ async function runGenerator(cliArgs = {}, options = {}) {
   }
 
   const commits = commitSets.flat();
+
+  // Fetch calendar events (optional – requires Google Calendar configuration)
+  const calendarEvents = await fetchCalendarEvents(range);
+
   const groupedCommits = groupCommits(commits);
-  const timesheet = generateHours(groupedCommits);
+  const timesheet = generateHours(groupedCommits, calendarEvents);
   const commitSummary = buildCommitSummary(commits);
   const matchedCommits = buildMatchedCommitsPayload(commits);
 
   printCommitSummary(commits);
   printMatchedCommits(commits);
+
+  if (calendarEvents.length > 0) {
+    console.log(`\nCalendar events found: ${calendarEvents.length}`);
+    for (const event of calendarEvents) {
+      console.log(`  ${event.date} ${event.summary} (${event.durationMinutes}min)`);
+    }
+  }
+
   printTimesheet(timesheet);
 
   const uploads = await uploadToJira(jiraClient, timesheet, { dryRun: normalizedArgs.dryRun });
@@ -1249,6 +1325,7 @@ async function runGenerator(cliArgs = {}, options = {}) {
   const result = {
     generatedAt,
     filters: buildFilters(range, normalizedArgs, repoSlugs),
+    calendarEvents: calendarEvents.length > 0 ? calendarEvents : undefined,
     commitSummary,
     matchedCommits,
     timesheet,
