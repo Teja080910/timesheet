@@ -1054,6 +1054,12 @@ function findMatchingWorklog(worklogs, entry) {
     }
 
     const commentText = extractJiraCommentText(worklog.comment);
+
+    if (entry.isFixedAllocation) {
+      return commentText.includes('Daily fixed allocation slot [')
+        && Number(worklog.timeSpentSeconds || 0) === entry.secondsSpent;
+    }
+
     return commentText.includes(`[${entry.matchingKey}]`);
   });
 }
@@ -1106,7 +1112,16 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
   for (const day of timesheet) {
     for (const entry of day.entries) {
-      // Calendar events always have a ticket assigned (PF-6866 for requirement meetings, PF-6870 otherwise)
+      if (entry.isCalendarEvent) {
+        console.log(`  [SKIP] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (calendar event, not uploaded).`);
+        results.push({
+          date: day.date,
+          ticketId: entry.ticketId,
+          status: 'skipped-calendar',
+          hours: entry.hours,
+        });
+        continue;
+      }
 
       const issueKey = entry.ticketId;
       const comment = buildWorklogComment(issueKey, entry);

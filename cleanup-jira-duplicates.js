@@ -32,7 +32,7 @@ function parseCleanupArgs(argv) {
 }
 
 function isManagedWorklog(commentText) {
-  return commentText.includes('Daily fixed allocation slot [') || commentText.includes('Entry [');
+  return commentText.includes('Daily fixed allocation slot [') || commentText.includes('Entry [') || commentText.match(/\[calendar-/);
 }
 
 function extractMarker(commentText) {
@@ -72,6 +72,14 @@ function getBucketFromStarted(started) {
 }
 
 function getBucketFromExpectedEntry(entry) {
+  if (!entry.segment) {
+    const minutes = entry.startMinutes;
+    if (minutes == null) return 'unknown';
+    if (minutes < SECOND_HALF_START_MINUTES) return 'first-half';
+    if (minutes < SECOND_HALF_END_MINUTES) return 'second-half';
+    return 'night';
+  }
+
   if (entry.segment.startsWith('first-half')) {
     return 'first-half';
   }
