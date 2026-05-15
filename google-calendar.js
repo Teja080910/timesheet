@@ -96,7 +96,7 @@ async function fetchCalendarEvents(range) {
       singleEvents: true,
       orderBy: 'startTime',
       maxResults: getMaxEvents(),
-    });
+    }, { timeout: 30000 });
   } catch (error) {
     console.error(`Failed to fetch calendar events: ${getErrorMessage(error)}`);
     return [];
@@ -119,10 +119,7 @@ async function fetchCalendarEvents(range) {
       continue;
     }
 
-    const offsetStr = (process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '+0000').trim();
-    const sign = offsetStr[0] === '-' ? -1 : 1;
-    const offsetMin = sign * (parseInt(offsetStr.slice(1, 3), 10) * 60 + parseInt(offsetStr.slice(3, 5), 10));
-    const localStart = new Date(startTime.getTime() + offsetMin * 60 * 1000);
+    const localStart = new Date(startTime.getTime());
     const date = localStart.toISOString().slice(0, 10);
     const summary = (event.summary || '(No title)').trim();
     const ticketId = extractTicketFromEvent(summary);

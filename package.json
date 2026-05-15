@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node generate-timesheet.js",
     "cleanup:duplicates": "node cleanup-jira-duplicates.js",
+    "delete:worklogs": "node delete-worklogs-by-date.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",

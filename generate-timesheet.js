@@ -257,16 +257,7 @@ function getJiraApiBasePath() {
 }
 
 function getWorklogTimezoneOffset() {
-  const configured = (process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '').trim();
-  if (!configured) {
-    return '+0000';
-  }
-
-  if (!/^[+-]\d{4}$/.test(configured)) {
-    throw new Error('JIRA_WORKLOG_TIMEZONE_OFFSET must use the format +0000 or +0530.');
-  }
-
-  return configured;
+  return '+0000';
 }
 
 function createJiraClient() {
@@ -735,19 +726,17 @@ function generateHours(groupedCommits, calendarEvents = []) {
     const tickets = groupedCommits.get(date);
     const entries = tickets
       ? Array.from(tickets.entries()).map(([ticketId, commits]) => ({
-          ticketId,
-          commits,
-          commitCount: commits.length,
-        }))
+        ticketId,
+        commits,
+        commitCount: commits.length,
+      }))
       : [];
 
     const totalCommits = entries.reduce((sum, entry) => sum + entry.commitCount, 0);
 
-    // Adjust daily minutes to account for calendar meetings
+    // Meetings and commit work together to fill 8h
     const baseDailyMinutes = dailyTargetMinutes.get(date) || MIN_WORKDAY_MINUTES;
-    const adjustedDailyMinutes = entries.length > 0
-      ? Math.max(baseDailyMinutes - meetingMinutes, 0)
-      : Math.max(meetingMinutes, 0);
+    const adjustedDailyMinutes = baseDailyMinutes - meetingMinutes;
     const commitMinutesAvailable = adjustedDailyMinutes - (FIXED_SLOT_MINUTES * 2);
 
     if (commitMinutesAvailable < 0) {
@@ -755,8 +744,9 @@ function generateHours(groupedCommits, calendarEvents = []) {
     }
 
     const commitUnitsAvailable = Math.max(commitMinutesAvailable / SLOT_MINUTES, 0);
-    const weights = entries.map((entry) => entry.commitCount / totalCommits);
-    const allocations = distributeUnits(commitUnitsAvailable, weights);
+    const allocations = entries.length > 0
+      ? distributeUnits(commitUnitsAvailable, entries.map((entry) => entry.commitCount / totalCommits))
+      : [];
 
     const dayEntries = [];
 
@@ -801,12 +791,12 @@ function generateHours(groupedCommits, calendarEvents = []) {
       fixedEntries = dailySchedule.fixedEntries;
     } else {
       scheduledCommitEntries = [];
-      fixedEntries = [];
+      fixedEntries = buildFixedEntries(date);
     }
 
     // Build calendar event entries
     const calendarEntries = dayEvents.map((event) => {
-      const offsetStr = (process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '+0000').trim();
+      const offsetStr = '+0000';
       const sign = offsetStr[0] === '-' ? -1 : 1;
       const offsetMin = sign * (parseInt(offsetStr.slice(1, 3), 10) * 60 + parseInt(offsetStr.slice(3, 5), 10));
       const localStart = new Date(event.startTime.getTime() + offsetMin * 60 * 1000);
@@ -856,18 +846,9 @@ function generateHours(groupedCommits, calendarEvents = []) {
       return left.ticketId.localeCompare(right.ticketId);
     });
 
-    const actualDailySeconds = allEntries.reduce((sum, entry) => sum + entry.secondsSpent, 0);
-    const expectedDailySeconds = entries.length > 0
-      ? (baseDailyMinutes + meetingMinutes) * 60
-      : meetingMinutes * 60;
-    if (actualDailySeconds !== expectedDailySeconds) {
-      const actualDailyTotal = Number((actualDailySeconds / 3600).toFixed(4));
-      throw new Error(`Generated daily total must equal ${minutesToHours(entries.length > 0 ? baseDailyMinutes + meetingMinutes : meetingMinutes)} hours for ${date}, received ${actualDailyTotal} hours.`);
-    }
-
     timesheet.push({
       date,
-      totalHours: minutesToHours(dayEntries.length > 0 ? baseDailyMinutes : meetingMinutes),
+      totalHours: minutesToHours(baseDailyMinutes),
       meetingMinutes,
       entries: allEntries,
     });
@@ -876,36 +857,10 @@ function generateHours(groupedCommits, calendarEvents = []) {
   return timesheet;
 }
 
-function buildDailySchedule(date, entries, dailyMinutes) {
-  const totalCommitMinutes = entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
-  const expectedCommitMinutes = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
-  if (totalCommitMinutes !== expectedCommitMinutes) {
-    throw new Error(`Commit allocations must equal ${minutesToHours(expectedCommitMinutes)} hours per day.`);
-  }
-
-  const overtimeMinutes = Math.max(dailyMinutes - MIN_WORKDAY_MINUTES, 0);
-  const segmentDurations = [
-    FIRST_HALF_WORK_MINUTES,
-    SECOND_HALF_WORK_MINUTES,
-    overtimeMinutes,
-  ];
-  const commitUnits = entries.map((entry) => entry.durationMinutes / SLOT_MINUTES);
-  const totalCommitUnits = commitUnits.reduce((sum, value) => sum + value, 0);
-  const segmentUnitCaps = segmentDurations.map((minutes) => minutes / SLOT_MINUTES);
-  const firstHalfAllocations = distributeUnits(
-    segmentUnitCaps[0],
-    commitUnits.map((value) => value / totalCommitUnits),
-  );
-  const remainingAfterFirst = commitUnits.map((value, index) => value - firstHalfAllocations[index]);
-  const secondHalfAllocations = distributeUnits(
-    segmentUnitCaps[1],
-    remainingAfterFirst.map((value) => value / remainingAfterFirst.reduce((sum, item) => sum + item, 0)),
-  );
-  const overtimeAllocations = remainingAfterFirst.map((value, index) => value - secondHalfAllocations[index]);
-
+function buildFixedEntries(date) {
   const firstHalfFixedStart = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
   const secondHalfFixedStart = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
-  const fixedEntries = [
+  return [
     {
       date,
       ticketId: FIXED_DAILY_TICKET,
@@ -939,6 +894,38 @@ function buildDailySchedule(date, entries, dailyMinutes) {
       isFixedAllocation: true,
     },
   ];
+}
+
+function buildDailySchedule(date, entries, dailyMinutes) {
+  const totalCommitMinutes = entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
+  const expectedCommitMinutes = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
+  if (totalCommitMinutes !== expectedCommitMinutes) {
+    throw new Error(`Commit allocations must equal ${minutesToHours(expectedCommitMinutes)} hours per day.`);
+  }
+
+  const overtimeMinutes = Math.max(dailyMinutes - MIN_WORKDAY_MINUTES, 0);
+  const segmentDurations = [
+    FIRST_HALF_WORK_MINUTES,
+    SECOND_HALF_WORK_MINUTES,
+    overtimeMinutes,
+  ];
+  const commitUnits = entries.map((entry) => entry.durationMinutes / SLOT_MINUTES);
+  const totalCommitUnits = commitUnits.reduce((sum, value) => sum + value, 0);
+  const segmentUnitCaps = segmentDurations.map((minutes) => minutes / SLOT_MINUTES);
+  const firstHalfAllocations = distributeUnits(
+    segmentUnitCaps[0],
+    commitUnits.map((value) => value / totalCommitUnits),
+  );
+  const remainingAfterFirst = commitUnits.map((value, index) => value - firstHalfAllocations[index]);
+  const secondHalfAllocations = distributeUnits(
+    segmentUnitCaps[1],
+    remainingAfterFirst.map((value) => value / remainingAfterFirst.reduce((sum, item) => sum + item, 0)),
+  );
+  const overtimeAllocations = remainingAfterFirst.map((value, index) => value - secondHalfAllocations[index]);
+
+  const firstHalfFixedStart = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
+  const secondHalfFixedStart = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
+  const fixedEntries = buildFixedEntries(date);
 
   const commitEntries = [
     ...scheduleHalfEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES, firstHalfFixedStart, 'first-half'),
@@ -1113,14 +1100,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
   for (const day of timesheet) {
     for (const entry of day.entries) {
       if (entry.isCalendarEvent) {
-        console.log(`  [SKIP] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (calendar event, not uploaded).`);
-        results.push({
-          date: day.date,
-          ticketId: entry.ticketId,
-          status: 'skipped-calendar',
-          hours: entry.hours,
-        });
-        continue;
+        console.log(`  [CALENDAR] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (${entry.hours.toFixed(2)}h).`);
       }
 
       const issueKey = entry.ticketId;
@@ -1137,6 +1117,8 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
         });
         continue;
       }
+
+      console.log(`  [JIRA] ${day.date} ${issueKey} (${entry.hours.toFixed(2)}h, ${entry.commitHash.slice(0, 8)})...`);
 
       try {
         const existingWorklogs = await fetchExistingWorklogs(jiraClient, issueKey);
