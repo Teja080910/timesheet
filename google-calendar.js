@@ -119,8 +119,8 @@ async function fetchCalendarEvents(range) {
       continue;
     }
 
-    const localStart = new Date(startTime.getTime());
-    const date = localStart.toISOString().slice(0, 10);
+    const rawDate = event.start.dateTime.slice(0, 10);
+    const date = rawDate;
     const summary = (event.summary || '(No title)').trim();
     const ticketId = extractTicketFromEvent(summary);
 
@@ -132,6 +132,8 @@ async function fetchCalendarEvents(range) {
       date,
       startTime,
       endTime,
+      startTimeStr: event.start.dateTime,
+      endTimeStr: event.end.dateTime,
       durationMinutes,
       htmlLink: event.htmlLink || '',
       isCalendarEvent: true,

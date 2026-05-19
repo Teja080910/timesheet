@@ -11,9 +11,14 @@ function parseArgs(argv) {
   let endDate = null;
   let execute = false;
 
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
     if (arg === '--execute') {
       execute = true;
+    } else if (arg === '--startDate' && i + 1 < argv.length) {
+      startDate = argv[++i];
+    } else if (arg === '--endDate' && i + 1 < argv.length) {
+      endDate = argv[++i];
     } else if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) {
       if (!startDate) {
         startDate = arg;

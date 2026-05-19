@@ -260,6 +260,12 @@ function getWorklogTimezoneOffset() {
   return '+0000';
 }
 
+
+
+function getCalendarTimezoneOffset() {
+  return process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '+0000';
+}
+
 function createJiraClient() {
   const headers = {
     Accept: 'application/json',
@@ -785,8 +791,14 @@ function generateHours(groupedCommits, calendarEvents = []) {
     let scheduledCommitEntries;
     let fixedEntries;
 
+    // Build busy intervals from calendar events for this day
+    const busyIntervals = dayEvents.map((event) => ({
+      start: event.startMinutes,
+      end: event.startMinutes + event.durationMinutes,
+    }));
+
     if (dayEntries.length > 0) {
-      const dailySchedule = buildDailySchedule(date, dayEntries, adjustedDailyMinutes);
+      const dailySchedule = buildDailySchedule(date, dayEntries, adjustedDailyMinutes, busyIntervals);
       scheduledCommitEntries = dailySchedule.commitEntries;
       fixedEntries = dailySchedule.fixedEntries;
     } else {
@@ -796,11 +808,14 @@ function generateHours(groupedCommits, calendarEvents = []) {
 
     // Build calendar event entries
     const calendarEntries = dayEvents.map((event) => {
-      const offsetStr = '+0000';
-      const sign = offsetStr[0] === '-' ? -1 : 1;
-      const offsetMin = sign * (parseInt(offsetStr.slice(1, 3), 10) * 60 + parseInt(offsetStr.slice(3, 5), 10));
-      const localStart = new Date(event.startTime.getTime() + offsetMin * 60 * 1000);
-      const startMinutes = localStart.getUTCHours() * 60 + localStart.getUTCMinutes();
+      const startTimePart = event.startTimeStr.slice(11, 16);
+      const [startHour, startMinute] = startTimePart.split(':').map(Number);
+      const startMinutes = startHour * 60 + startMinute;
+      // Google sends 2026-05-15T10:30:00+05:30, Jira needs 2026-05-15T10:30:00.000+0530
+      const startedTimestamp = event.startTimeStr
+        .replace(/\.\d+Z$/, '.000+0000')
+        .replace(/^(.+?)\.\d{3}([+-]\d{2}):(\d{2})$/, '$1$2$3')
+        .replace(/^(.+?)([+-]\d{2}):(\d{2})$/, '$1.000$2$3');
       const label = (process.env.GOOGLE_CALENDAR_EVENT_LABEL || 'Meeting').trim();
       let ticketId = event.ticketId;
       if (!ticketId) {
@@ -828,6 +843,7 @@ function generateHours(groupedCommits, calendarEvents = []) {
         isCalendarEvent: true,
         htmlLink: event.htmlLink,
         summary: event.summary,
+        startedTimestamp,
       };
     });
 
@@ -896,7 +912,7 @@ function buildFixedEntries(date) {
   ];
 }
 
-function buildDailySchedule(date, entries, dailyMinutes) {
+function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
   const totalCommitMinutes = entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
   const expectedCommitMinutes = dailyMinutes - (FIXED_SLOT_MINUTES * 2);
   if (totalCommitMinutes !== expectedCommitMinutes) {
@@ -928,9 +944,9 @@ function buildDailySchedule(date, entries, dailyMinutes) {
   const fixedEntries = buildFixedEntries(date);
 
   const commitEntries = [
-    ...scheduleHalfEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES, firstHalfFixedStart, 'first-half'),
-    ...scheduleHalfEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES, secondHalfFixedStart, 'second-half'),
-    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night'),
+    ...scheduleHalfEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES, firstHalfFixedStart, 'first-half', busyIntervals),
+    ...scheduleHalfEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES, secondHalfFixedStart, 'second-half', busyIntervals),
+    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night', busyIntervals),
   ];
 
   return {
@@ -939,7 +955,7 @@ function buildDailySchedule(date, entries, dailyMinutes) {
   };
 }
 
-function scheduleHalfEntries(entries, allocations, segmentStartMinutes, segmentDurationMinutes, fixedSlotStartMinutes, segmentName) {
+function scheduleHalfEntries(entries, allocations, segmentStartMinutes, segmentDurationMinutes, fixedSlotStartMinutes, segmentName, busyIntervals = []) {
   const totalUnits = allocations.reduce((sum, value) => sum + value, 0);
   if (totalUnits === 0) {
     return [];
@@ -960,12 +976,12 @@ function scheduleHalfEntries(entries, allocations, segmentStartMinutes, segmentD
   }
 
   return [
-    ...schedulePlainSegmentEntries(entries, beforeAllocations, segmentStartMinutes, `${segmentName}-before`),
-    ...schedulePlainSegmentEntries(entries, afterAllocations, fixedSlotStartMinutes + FIXED_SLOT_MINUTES, `${segmentName}-after`),
+    ...schedulePlainSegmentEntries(entries, beforeAllocations, segmentStartMinutes, `${segmentName}-before`, busyIntervals),
+    ...schedulePlainSegmentEntries(entries, afterAllocations, fixedSlotStartMinutes + FIXED_SLOT_MINUTES, `${segmentName}-after`, busyIntervals),
   ];
 }
 
-function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName) {
+function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName, busyIntervals = []) {
   const scheduled = [];
   let cursor = segmentStartMinutes;
 
@@ -976,6 +992,13 @@ function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, 
     }
 
     const durationMinutes = allocatedUnits * SLOT_MINUTES;
+    // Skip over busy intervals (calendar events) that overlap with cursor
+    for (const busy of busyIntervals) {
+      if (cursor >= busy.start && cursor < busy.end) {
+        cursor = busy.end;
+      }
+    }
+
     scheduled.push({
       ...entries[index],
       hours: minutesToHours(durationMinutes),
@@ -1011,6 +1034,13 @@ function getStartedTimestamp(date, startMinutes = FIRST_HALF_START_MINUTES) {
   const hours = String(Math.floor(startMinutes / 60)).padStart(2, '0');
   const minutes = String(startMinutes % 60).padStart(2, '0');
   return `${date}T${hours}:${minutes}:00.000${getWorklogTimezoneOffset()}`;
+}
+
+function getEntryStartedTimestamp(date, entry) {
+  if (entry.isCalendarEvent && entry.startedTimestamp) {
+    return entry.startedTimestamp;
+  }
+  return getStartedTimestamp(date, entry.startMinutes);
 }
 
 function extractJiraCommentText(comment) {
@@ -1100,14 +1130,14 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
   for (const day of timesheet) {
     for (const entry of day.entries) {
       if (entry.isCalendarEvent) {
-        console.log(`  [CALENDAR] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (${entry.hours.toFixed(2)}h).`);
+        console.log(`  [CALENDAR] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (${entry.hours.toFixed(2)}h) @ ${getEntryStartedTimestamp(day.date, entry)}.`);
       }
 
       const issueKey = entry.ticketId;
       const comment = buildWorklogComment(issueKey, entry);
 
       if (options.dryRun) {
-        console.log(`[DRY RUN] ${day.date} ${issueKey} ${entry.hours}h ${entry.commitHash.slice(0, 8)} @ ${getStartedTimestamp(day.date, entry.startMinutes)}`);
+        console.log(`[DRY RUN] ${day.date} ${issueKey} ${entry.hours}h ${entry.commitHash.slice(0, 8)} @ ${getEntryStartedTimestamp(day.date, entry)}`);
         results.push({
           date: day.date,
           ticketId: issueKey,
@@ -1128,7 +1158,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
             () => jiraClient.put(
               `${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog/${encodeURIComponent(matchingWorklog.id)}`,
               {
-                started: getStartedTimestamp(day.date, entry.startMinutes),
+                started: getEntryStartedTimestamp(day.date, entry),
                 timeSpentSeconds: entry.secondsSpent,
                 comment: normalizeJiraComment(comment),
               },
@@ -1151,7 +1181,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
         await retry(
           () => jiraClient.post(`${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog`, {
-            started: getStartedTimestamp(day.date, entry.startMinutes),
+            started: getEntryStartedTimestamp(day.date, entry),
             timeSpentSeconds: entry.secondsSpent,
             comment: normalizeJiraComment(comment),
           }),

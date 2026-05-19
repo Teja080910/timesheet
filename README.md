@@ -110,13 +110,27 @@ Dry run first:
 npm run cleanup:duplicates -- --startDate 2026-04-13 --endDate 2026-04-17
 ```
 
-Delete the duplicates:
+clear the duplicates:
 
 ```bash
 npm run cleanup:duplicates -- --startDate 2026-04-13 --endDate 2026-04-17 --execute
 ```
 
 After deletion, rerun the generator for the same date range if you want Jira to be rebuilt using the current deterministic schedule.
+
+## Delete worklogs
+
+Delete all managed worklogs in a date range. Dry run first:
+
+```bash
+npm run delete:worklogs -- --startDate 2026-05-15 --endDate 2026-05-19
+```
+
+To actually delete:
+
+```bash
+npm run delete:worklogs -- 2026-05-15 2026-05-19 --execute
+```
 
 ## Worklog timing rules
 
