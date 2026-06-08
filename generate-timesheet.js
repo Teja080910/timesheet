@@ -811,7 +811,6 @@ function generateHours(groupedCommits, calendarEvents = []) {
       const startTimePart = event.startTimeStr.slice(11, 16);
       const [startHour, startMinute] = startTimePart.split(':').map(Number);
       const startMinutes = startHour * 60 + startMinute;
-      // Google sends 2026-05-15T10:30:00+05:30, Jira needs 2026-05-15T10:30:00.000+0530
       const startedTimestamp = event.startTimeStr
         .replace(/\.\d+Z$/, '.000+0000')
         .replace(/^(.+?)\.\d{3}([+-]\d{2}):(\d{2})$/, '$1$2$3')
