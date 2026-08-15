@@ -9,7 +9,7 @@
  *   GOOGLE_CALENDAR_ID            – Calendar ID to fetch events from
  *
  * Optional:
- *   GOOGLE_CALENDAR_MAX_EVENTS    – Max events per fetch (default: 100)
+ *   GOOGLE_CALENDAR_MAX_EVENTS    – Max events per fetch (default: 500)
  *   GOOGLE_CALENDAR_EVENT_LABEL    – Label prefix (default: "Meeting")
  */
 
@@ -54,13 +54,37 @@ function getCalendarConfig() {
 
 function getMaxEvents() {
   const raw = (process.env.GOOGLE_CALENDAR_MAX_EVENTS || '').trim();
-  if (!raw) return 100;
+  if (!raw) return 500;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 500;
 }
 
 function getEventLabel() {
   return (process.env.GOOGLE_CALENDAR_EVENT_LABEL || 'Meeting').trim();
+}
+
+/**
+ * Follows `nextPageToken` until either the range is exhausted or `maxEvents` items have been
+ * collected. `fetchPage({ pageToken, maxResults })` must return a Google-Calendar-API-shaped
+ * `{ data: { items, nextPageToken } }` response — kept separate from fetchCalendarEvents so it's
+ * unit-testable without a real (or mocked) googleapis client.
+ * @returns {Promise<{ items: Array<object>, truncated: boolean }>}
+ */
+async function collectPaginatedEvents(fetchPage, maxEvents) {
+  const items = [];
+  let pageToken;
+
+  do {
+    const response = await fetchPage({
+      pageToken,
+      maxResults: Math.min(maxEvents - items.length, 250),
+    });
+
+    items.push(...(response.data.items || []));
+    pageToken = response.data.nextPageToken;
+  } while (pageToken && items.length < maxEvents);
+
+  return { items, truncated: Boolean(pageToken && items.length >= maxEvents) };
 }
 
 /**
@@ -86,23 +110,35 @@ async function fetchCalendarEvents(range) {
   });
 
   const calendar = google.calendar({ version: 'v3', auth });
+  const maxEvents = getMaxEvents();
 
-  let response;
+  let result;
   try {
-    response = await calendar.events.list({
-      calendarId: config.calendarId,
-      timeMin: new Date(`${range.startDateStr}T00:00:00.000Z`).toISOString(),
-      timeMax: new Date(`${range.endDateStr}T23:59:59.999Z`).toISOString(),
-      singleEvents: true,
-      orderBy: 'startTime',
-      maxResults: getMaxEvents(),
-    }, { timeout: 30000 });
+    result = await collectPaginatedEvents(
+      ({ pageToken, maxResults }) => calendar.events.list({
+        calendarId: config.calendarId,
+        timeMin: new Date(`${range.startDateStr}T00:00:00.000Z`).toISOString(),
+        timeMax: new Date(`${range.endDateStr}T23:59:59.999Z`).toISOString(),
+        singleEvents: true,
+        orderBy: 'startTime',
+        maxResults,
+        pageToken,
+      }, { timeout: 30000 }),
+      maxEvents,
+    );
   } catch (error) {
     console.error(`Failed to fetch calendar events: ${getErrorMessage(error)}`);
     return [];
   }
 
-  const items = response.data.items || [];
+  if (result.truncated) {
+    console.warn(
+      `Calendar fetch stopped at GOOGLE_CALENDAR_MAX_EVENTS=${maxEvents}; more events exist in `
+      + `${range.startDateStr}..${range.endDateStr} but were not fetched. Raise GOOGLE_CALENDAR_MAX_EVENTS if needed.`,
+    );
+  }
+
+  const items = result.items;
   const parsed = [];
 
   for (const event of items) {
@@ -152,4 +188,10 @@ function extractTicketFromEvent(summary) {
   return match ? match[0].toUpperCase() : null;
 }
 
-module.exports = { fetchCalendarEvents, getCalendarConfig, extractTicketFromEvent };
+module.exports = {
+  fetchCalendarEvents,
+  getCalendarConfig,
+  extractTicketFromEvent,
+  // Exported for unit tests (test/scheduling.test.js) — not part of the module's public surface.
+  collectPaginatedEvents,
+};

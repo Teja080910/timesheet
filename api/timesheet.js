@@ -1,6 +1,21 @@
 'use strict';
 
+const crypto = require('crypto');
 const { getErrorMessage, runGenerator } = require('../generate-timesheet');
+
+function timingSafeEqual(candidate, expected) {
+  const candidateBuffer = Buffer.from(String(candidate));
+  const expectedBuffer = Buffer.from(String(expected));
+
+  if (candidateBuffer.length !== expectedBuffer.length) {
+    // Still run a same-length comparison so a length mismatch doesn't return faster
+    // than a full comparison would, which would otherwise leak the token's length.
+    crypto.timingSafeEqual(expectedBuffer, expectedBuffer);
+    return false;
+  }
+
+  return crypto.timingSafeEqual(candidateBuffer, expectedBuffer);
+}
 
 function sendJson(response, statusCode, payload) {
   response.statusCode = statusCode;
@@ -78,7 +93,7 @@ function isAuthorized(request, requestBody) {
     requestBody.token,
   ].filter((value) => typeof value === 'string' && value.trim());
 
-  const matched = candidateTokens.some((value) => value.trim() === configuredToken);
+  const matched = candidateTokens.some((value) => timingSafeEqual(value.trim(), configuredToken));
   return matched
     ? { ok: true }
     : { ok: false, reason: 'Missing or invalid API token.' };

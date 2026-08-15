@@ -15,6 +15,7 @@ const {
   retry,
   runGenerator,
 } = require('./generate-timesheet');
+const { isManagedWorklog } = require('./worklog-utils');
 
 const SECOND_HALF_START_MINUTES = 14 * 60 + 30;
 const SECOND_HALF_END_MINUTES = 19 * 60 + 30;
@@ -29,10 +30,6 @@ function parseCleanupArgs(argv) {
     days: baseArgs.days,
     dryRun: !execute,
   };
-}
-
-function isManagedWorklog(commentText) {
-  return commentText.includes('Daily fixed allocation slot [') || commentText.includes('Entry [') || commentText.match(/\[calendar-/);
 }
 
 function extractMarker(commentText) {
@@ -183,6 +180,9 @@ function selectWorklogsToKeep(expectedEntries, existingWorklogs) {
 function buildExpectedEntries(result) {
   const byGroup = new Map();
 
+  // Calendar/meeting entries are uploaded to Jira just like commit entries (see
+  // uploadToJira/buildWorklogComment), so they count as "expected" here too — otherwise a
+  // legitimately-uploaded meeting worklog would look unexpected and get deleted as a duplicate.
   for (const day of result.timesheet || []) {
     for (const entry of day.entries || []) {
       const issueKey = entry.ticketId;
@@ -265,21 +265,30 @@ async function findDuplicateCleanupPlan(jiraClient, generatedResult) {
 
 async function deleteWorklogs(jiraClient, deletions) {
   const deleted = [];
+  const failed = [];
 
   for (const worklog of deletions) {
-    await retry(
-      () => jiraClient.delete(
-        `${getJiraApiBasePath()}/issue/${encodeURIComponent(worklog.issueKey)}/worklog/${encodeURIComponent(worklog.id)}`,
-      ),
-      3,
-      `Worklog delete for ${worklog.issueKey} on ${worklog.date}`,
-    );
+    try {
+      await retry(
+        () => jiraClient.delete(
+          `${getJiraApiBasePath()}/issue/${encodeURIComponent(worklog.issueKey)}/worklog/${encodeURIComponent(worklog.id)}`,
+        ),
+        3,
+        `Worklog delete for ${worklog.issueKey} on ${worklog.date}`,
+      );
 
-    deleted.push(worklog);
-    console.log(`[DELETED] ${worklog.date} ${worklog.issueKey} worklog ${worklog.id} ${worklog.secondsSpent}s ${worklog.commentText}`);
+      deleted.push(worklog);
+      console.log(`[DELETED] ${worklog.date} ${worklog.issueKey} worklog ${worklog.id} ${worklog.secondsSpent}s ${worklog.commentText}`);
+    } catch (error) {
+      // Don't let one un-deletable worklog (e.g. permission errors on worklogs owned by someone
+      // else) abort the whole run and leave every remaining duplicate undeleted — skip it and
+      // keep going, same as uploadToJira does for individual upload failures.
+      failed.push({ ...worklog, error: getErrorMessage(error) });
+      console.error(`[FAILED] ${worklog.date} ${worklog.issueKey} worklog ${worklog.id}: ${getErrorMessage(error)}`);
+    }
   }
 
-  return deleted;
+  return { deleted, failed };
 }
 
 async function main() {
@@ -315,8 +324,11 @@ async function main() {
     return;
   }
 
-  await deleteWorklogs(jiraClient, plan.deletions);
-  console.log(`\nDeleted ${plan.deletions.length} duplicate Jira worklog(s).`);
+  const { deleted, failed } = await deleteWorklogs(jiraClient, plan.deletions);
+  console.log(`\nDeleted ${deleted.length} of ${plan.deletions.length} duplicate Jira worklog(s).`);
+  if (failed.length > 0) {
+    console.log(`${failed.length} worklog(s) could not be deleted (see [FAILED] lines above) — usually because they belong to someone else and this token lacks permission to remove them.`);
+  }
   console.log('Run the generator again for the same date range if you want Jira to reflect the current deterministic schedule exactly.');
 }
 

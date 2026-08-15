@@ -8,11 +8,15 @@ const fs = require('fs/promises');
 const path = require('path');
 const axios = require('axios');
 const { fetchCalendarEvents } = require('./google-calendar');
+const { isManagedWorklog } = require('./worklog-utils');
 
 const TICKET_REGEX = /PF-\d+/i;
 const DEFAULT_LOOKBACK_DAYS = 7;
 const MIN_WORKDAY_MINUTES = 8 * 60;
-const FIXED_DAILY_TICKET = 'PF-6863';
+const FIXED_DAILY_TICKET = (process.env.TIMESHEET_FIXED_TICKET || 'PF-6863').trim();
+const DEFAULT_FALLBACK_TICKET = (process.env.TIMESHEET_DEFAULT_TICKET || 'PF-16716').trim();
+const MEETING_REQUIREMENT_TICKET = (process.env.TIMESHEET_REQUIREMENT_MEETING_TICKET || 'PF-6866').trim();
+const MEETING_DEFAULT_TICKET = (process.env.TIMESHEET_MEETING_TICKET || 'PF-6870').trim();
 const FIXED_SLOT_MINUTES = 30;
 const FIRST_HALF_MINUTES = 3 * 60;
 const SECOND_HALF_MINUTES = 5 * 60;
@@ -88,6 +92,15 @@ function parseArgs(argv) {
 
 function formatDate(date) {
   return date.toISOString().slice(0, 10);
+}
+
+// Minutes-from-midnight for a calendar event, derived from its ISO start timestamp.
+// Calendar events never carry a `startMinutes` field of their own (see google-calendar.js) —
+// this is the single source of truth so busy-interval math and display use the same value.
+function getEventStartMinutes(event) {
+  const startTimePart = event.startTimeStr.slice(11, 16);
+  const [startHour, startMinute] = startTimePart.split(':').map(Number);
+  return (startHour * 60) + startMinute;
 }
 
 function parseDateInput(value, fieldName) {
@@ -257,13 +270,7 @@ function getJiraApiBasePath() {
 }
 
 function getWorklogTimezoneOffset() {
-  return '+0000';
-}
-
-
-
-function getCalendarTimezoneOffset() {
-  return process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '+0000';
+  return (process.env.JIRA_WORKLOG_TIMEZONE_OFFSET || '+0000').trim();
 }
 
 function createJiraClient() {
@@ -301,7 +308,7 @@ function extractTicket(commitMessage, branchNames = []) {
     }
   }
 
-  return 'PF-16716';
+  return DEFAULT_FALLBACK_TICKET;
 }
 
 function extractCommitAuthorEmails(commit) {
@@ -792,10 +799,13 @@ function generateHours(groupedCommits, calendarEvents = []) {
     let fixedEntries;
 
     // Build busy intervals from calendar events for this day
-    const busyIntervals = dayEvents.map((event) => ({
-      start: event.startMinutes,
-      end: event.startMinutes + event.durationMinutes,
-    }));
+    const busyIntervals = dayEvents.map((event) => {
+      const startMinutes = getEventStartMinutes(event);
+      return {
+        start: startMinutes,
+        end: startMinutes + event.durationMinutes,
+      };
+    });
 
     if (dayEntries.length > 0) {
       const dailySchedule = buildDailySchedule(date, dayEntries, adjustedDailyMinutes, busyIntervals);
@@ -803,24 +813,25 @@ function generateHours(groupedCommits, calendarEvents = []) {
       fixedEntries = dailySchedule.fixedEntries;
     } else {
       scheduledCommitEntries = [];
-      fixedEntries = buildFixedEntries(date);
+      fixedEntries = buildFixedEntries(date, busyIntervals);
     }
 
     // Build calendar event entries
     const calendarEntries = dayEvents.map((event) => {
-      const startTimePart = event.startTimeStr.slice(11, 16);
-      const [startHour, startMinute] = startTimePart.split(':').map(Number);
-      const startMinutes = startHour * 60 + startMinute;
-      const startedTimestamp = event.startTimeStr
-        .replace(/\.\d+Z$/, '.000+0000')
-        .replace(/^(.+?)\.\d{3}([+-]\d{2}):(\d{2})$/, '$1$2$3')
-        .replace(/^(.+?)([+-]\d{2}):(\d{2})$/, '$1.000$2$3');
+      const startMinutes = getEventStartMinutes(event);
+      // Use the same "literal wall-clock digits + configured offset" convention as commit/fixed
+      // entries (getStartedTimestamp), NOT the meeting's true UTC-converted instant. Jira does not
+      // convert worklog "started" times per viewer on display — it shows exactly the UTC instant
+      // you submit — so preserving the real +05:30 offset here made meetings display 5.5h earlier
+      // than the real meeting time (e.g. a 9:25 AM IST meeting showed as "3:55"). Matching the
+      // fixed/commit convention makes the displayed time match the real local meeting time instead.
+      const startedTimestamp = getStartedTimestamp(date, startMinutes);
       const label = (process.env.GOOGLE_CALENDAR_EVENT_LABEL || 'Meeting').trim();
       let ticketId = event.ticketId;
       if (!ticketId) {
         ticketId = (event.summary || '').toLowerCase().includes('requirement') || (event.summary || '').toLowerCase().includes('requirment')
-          ? 'PF-6866'
-          : 'PF-6870';
+          ? MEETING_REQUIREMENT_TICKET
+          : MEETING_DEFAULT_TICKET;
       }
       const description = event.ticketId
         ? `#${event.ticketId} ${event.summary}`
@@ -872,9 +883,50 @@ function generateHours(groupedCommits, calendarEvents = []) {
   return timesheet;
 }
 
-function buildFixedEntries(date) {
-  const firstHalfFixedStart = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
-  const secondHalfFixedStart = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
+function freeMinutesInWindow(windowStart, windowEnd, busyIntervals = []) {
+  let free = windowEnd - windowStart;
+
+  for (const busy of busyIntervals) {
+    const overlapStart = Math.max(windowStart, busy.start);
+    const overlapEnd = Math.min(windowEnd, busy.end);
+    if (overlapEnd > overlapStart) {
+      free -= (overlapEnd - overlapStart);
+    }
+  }
+
+  return Math.max(free, 0);
+}
+
+function pushPastBusyIntervals(candidateStart, durationMinutes, busyIntervals = []) {
+  let cursor = candidateStart;
+  let changed = true;
+  let guard = 0;
+
+  // Repeatedly jump to the end of any interval the full [cursor, cursor+duration) span still
+  // overlaps. Bounded by busyIntervals.length + 1 passes, so this always terminates.
+  while (changed && guard <= busyIntervals.length) {
+    changed = false;
+    guard += 1;
+
+    for (const busy of busyIntervals) {
+      if (cursor < busy.end && (cursor + durationMinutes) > busy.start) {
+        cursor = busy.end;
+        changed = true;
+      }
+    }
+  }
+
+  return cursor;
+}
+
+function buildFixedEntries(date, busyIntervals = []) {
+  const firstHalfCandidate = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
+  const secondHalfCandidate = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
+
+  // Nudge each fixed slot past any calendar meeting it would otherwise land inside of.
+  const firstHalfFixedStart = pushPastBusyIntervals(firstHalfCandidate, FIXED_SLOT_MINUTES, busyIntervals);
+  const secondHalfFixedStart = pushPastBusyIntervals(secondHalfCandidate, FIXED_SLOT_MINUTES, busyIntervals);
+
   return [
     {
       date,
@@ -918,66 +970,69 @@ function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
     throw new Error(`Commit allocations must equal ${minutesToHours(expectedCommitMinutes)} hours per day.`);
   }
 
-  const overtimeMinutes = Math.max(dailyMinutes - MIN_WORKDAY_MINUTES, 0);
-  const segmentDurations = [
-    FIRST_HALF_WORK_MINUTES,
-    SECOND_HALF_WORK_MINUTES,
-    overtimeMinutes,
-  ];
+  const sortedBusyIntervals = [...busyIntervals].sort((left, right) => left.start - right.start);
+
+  // Fixed slots are placed first (dodging meetings) so commit work can be scheduled around them.
+  const fixedEntries = buildFixedEntries(date, sortedBusyIntervals);
+  const fixedIntervals = fixedEntries.map((entry) => ({
+    start: entry.startMinutes,
+    end: entry.startMinutes + entry.durationMinutes,
+  }));
+  const occupiedIntervals = [...sortedBusyIntervals, ...fixedIntervals].sort((left, right) => left.start - right.start);
+
+  // Real free work time left in each daytime window once meetings and the fixed slot are
+  // accounted for. Unlike the old fixed 150min/270min caps, this shrinks when a meeting eats
+  // into the window, so commit work is never over-scheduled on top of meeting time.
+  const firstHalfCapMinutes = freeMinutesInWindow(
+    FIRST_HALF_START_MINUTES,
+    FIRST_HALF_START_MINUTES + FIRST_HALF_MINUTES,
+    occupiedIntervals,
+  );
+  const secondHalfCapMinutes = freeMinutesInWindow(
+    SECOND_HALF_START_MINUTES,
+    SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES,
+    occupiedIntervals,
+  );
+
   const commitUnits = entries.map((entry) => entry.durationMinutes / SLOT_MINUTES);
   const totalCommitUnits = commitUnits.reduce((sum, value) => sum + value, 0);
-  const segmentUnitCaps = segmentDurations.map((minutes) => minutes / SLOT_MINUTES);
+
+  const firstHalfUnitsAvailable = Math.floor(firstHalfCapMinutes / SLOT_MINUTES);
+  const secondHalfUnitsAvailable = Math.floor(secondHalfCapMinutes / SLOT_MINUTES);
+
+  // Allocate greedily: fill the first half up to whatever's actually free there, spill the
+  // remainder into the second half up to its own free capacity, and let anything left over
+  // flow into the uncapped overtime/"night" segment. The three buckets always sum back to
+  // totalCommitUnits exactly, so allocations are never negative or silently dropped.
+  const firstHalfTotalUnits = Math.min(totalCommitUnits, firstHalfUnitsAvailable);
   const firstHalfAllocations = distributeUnits(
-    segmentUnitCaps[0],
+    firstHalfTotalUnits,
     commitUnits.map((value) => value / totalCommitUnits),
   );
+
   const remainingAfterFirst = commitUnits.map((value, index) => value - firstHalfAllocations[index]);
-  const secondHalfAllocations = distributeUnits(
-    segmentUnitCaps[1],
-    remainingAfterFirst.map((value) => value / remainingAfterFirst.reduce((sum, item) => sum + item, 0)),
-  );
+  const remainingAfterFirstTotal = remainingAfterFirst.reduce((sum, value) => sum + value, 0);
+
+  const secondHalfTotalUnits = Math.min(remainingAfterFirstTotal, secondHalfUnitsAvailable);
+  const secondHalfAllocations = remainingAfterFirstTotal > 0
+    ? distributeUnits(
+      secondHalfTotalUnits,
+      remainingAfterFirst.map((value) => value / remainingAfterFirstTotal),
+    )
+    : remainingAfterFirst.map(() => 0);
+
   const overtimeAllocations = remainingAfterFirst.map((value, index) => value - secondHalfAllocations[index]);
 
-  const firstHalfFixedStart = getDeterministicFixedSlotStart(`${date}:first-half-fixed`, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES);
-  const secondHalfFixedStart = getDeterministicFixedSlotStart(`${date}:second-half-fixed`, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES);
-  const fixedEntries = buildFixedEntries(date);
-
   const commitEntries = [
-    ...scheduleHalfEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, FIRST_HALF_MINUTES, firstHalfFixedStart, 'first-half', busyIntervals),
-    ...scheduleHalfEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, SECOND_HALF_MINUTES, secondHalfFixedStart, 'second-half', busyIntervals),
-    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night', busyIntervals),
+    ...schedulePlainSegmentEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, 'first-half', occupiedIntervals),
+    ...schedulePlainSegmentEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, 'second-half', occupiedIntervals),
+    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night', occupiedIntervals),
   ];
 
   return {
     fixedEntries,
     commitEntries,
   };
-}
-
-function scheduleHalfEntries(entries, allocations, segmentStartMinutes, segmentDurationMinutes, fixedSlotStartMinutes, segmentName, busyIntervals = []) {
-  const totalUnits = allocations.reduce((sum, value) => sum + value, 0);
-  if (totalUnits === 0) {
-    return [];
-  }
-
-  const beforeFixedUnits = (fixedSlotStartMinutes - segmentStartMinutes) / SLOT_MINUTES;
-  const afterFixedUnits = ((segmentStartMinutes + segmentDurationMinutes) - (fixedSlotStartMinutes + FIXED_SLOT_MINUTES)) / SLOT_MINUTES;
-  let remainingBeforeUnits = beforeFixedUnits;
-  const beforeAllocations = allocations.map((value) => {
-    const assigned = Math.min(value, remainingBeforeUnits);
-    remainingBeforeUnits -= assigned;
-    return assigned;
-  });
-  const afterAllocations = allocations.map((value, index) => value - beforeAllocations[index]);
-
-  if (afterAllocations.reduce((sum, value) => sum + value, 0) !== afterFixedUnits) {
-    throw new Error(`Generated ${segmentName} schedule does not fit around fixed ticket placement.`);
-  }
-
-  return [
-    ...schedulePlainSegmentEntries(entries, beforeAllocations, segmentStartMinutes, `${segmentName}-before`, busyIntervals),
-    ...schedulePlainSegmentEntries(entries, afterAllocations, fixedSlotStartMinutes + FIXED_SLOT_MINUTES, `${segmentName}-after`, busyIntervals),
-  ];
 }
 
 function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName, busyIntervals = []) {
@@ -991,12 +1046,9 @@ function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, 
     }
 
     const durationMinutes = allocatedUnits * SLOT_MINUTES;
-    // Skip over busy intervals (calendar events) that overlap with cursor
-    for (const busy of busyIntervals) {
-      if (cursor >= busy.start && cursor < busy.end) {
-        cursor = busy.end;
-      }
-    }
+    // Push the cursor past any busy interval (calendar meeting or fixed slot) that the full
+    // [cursor, cursor+durationMinutes) span would overlap, not just cursor's starting point.
+    cursor = pushPastBusyIntervals(cursor, durationMinutes, busyIntervals);
 
     scheduled.push({
       ...entries[index],
@@ -1013,7 +1065,20 @@ function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, 
   return scheduled;
 }
 
+// Strips characters outside the Basic Multilingual Plane (most emoji, e.g. 🧘 🚨). Some Jira
+// Server/Data Center installs store worklog comments in a legacy MySQL "utf8" (3-byte) column
+// rather than "utf8mb4" (4-byte) — inserting a 4-byte character then fails with a generic
+// "Caught SQLException for insert into worklog" 500 error. Meeting titles pulled verbatim from
+// Google Calendar are the most likely source of these, so every comment gets sanitized here.
+function stripAstralSymbols(text) {
+  return text.replace(/[\u{10000}-\u{10FFFF}]/gu, '');
+}
+
 function buildWorklogComment(ticketId, entry) {
+  return stripAstralSymbols(buildWorklogCommentText(ticketId, entry));
+}
+
+function buildWorklogCommentText(ticketId, entry) {
   if (entry.isFixedAllocation) {
     return `Worked on ${ticketId}. Daily fixed allocation slot [${entry.matchingKey}].`;
   }
@@ -1063,19 +1128,67 @@ function extractJiraCommentText(comment) {
   return parts.join(' ').trim();
 }
 
-function findMatchingWorklog(worklogs, entry) {
+// Fetches the identity of the account this Jira client authenticates as. Used so
+// findMatchingWorklog never mistakes someone ELSE's worklog for one of ours to update.
+async function getCurrentJiraUser(jiraClient) {
+  const response = await retry(
+    () => jiraClient.get('/rest/api/2/myself'),
+    3,
+    'Fetching current Jira user',
+  );
+
+  return {
+    name: response.data.name || '',
+    emailAddress: (response.data.emailAddress || '').toLowerCase(),
+    key: response.data.key || response.data.accountId || '',
+  };
+}
+
+function isSameJiraUser(currentUser, author) {
+  if (!currentUser || !author) {
+    return true; // Nothing to compare against — don't block matching over missing data.
+  }
+
+  if (currentUser.emailAddress && author.emailAddress) {
+    return currentUser.emailAddress === author.emailAddress.toLowerCase();
+  }
+
+  if (currentUser.key && author.key) {
+    return currentUser.key === author.key;
+  }
+
+  if (currentUser.name && author.name) {
+    return currentUser.name === author.name;
+  }
+
+  return true;
+}
+
+function findMatchingWorklog(worklogs, entry, currentUser) {
   return (worklogs || []).find((worklog) => {
     if (typeof worklog.started !== 'string' || !worklog.started.startsWith(entry.date)) {
       return false;
     }
 
-    const commentText = extractJiraCommentText(worklog.comment);
-
-    if (entry.isFixedAllocation) {
-      return commentText.includes('Daily fixed allocation slot [')
-        && Number(worklog.timeSpentSeconds || 0) === entry.secondsSpent;
+    // Shared tickets (PF-6863, PF-6870, the unmatched-commit fallback, ...) can carry worklogs
+    // from OTHER people running this same generator against their own commits/calendar. Without
+    // this check, a comment-only match would try to "update" a colleague's worklog — which not
+    // only fails (you can't edit someone else's worklog without elevated permission) but also
+    // means our own contribution for that slot never gets created at all. Only ever treat a
+    // worklog as "ours to manage" if the account that authored it is the one we're running as.
+    if (!isSameJiraUser(currentUser, worklog.author)) {
+      return false;
     }
 
+    const commentText = extractJiraCommentText(worklog.comment);
+
+    // Bug fix: this used to just check for the generic "Daily fixed allocation slot [" phrase
+    // plus duration, which matches EITHER the AM or PM slot indiscriminately (both are always
+    // exactly 30min). That let the AM and PM entries fight over the same worklog on every run —
+    // whichever was processed first "won" it, and the other physical worklog was silently never
+    // touched again, no matter how many times the generator re-ran. The comment already embeds
+    // the specific first-half-fixed/second-half-fixed marker (see buildFixedEntries) — match on
+    // that exact key instead, same as every other entry type below.
     return commentText.includes(`[${entry.matchingKey}]`);
   });
 }
@@ -1123,12 +1236,84 @@ function normalizeJiraComment(text) {
   };
 }
 
+function getMaxDailySeconds() {
+  const raw = (process.env.TIMESHEET_MAX_DAILY_HOURS || '9.5').trim();
+  const hours = Number(raw);
+  return (Number.isFinite(hours) && hours > 0 ? hours : 9.5) * 3600;
+}
+
+// Total this generator has itself logged in Jira for this date, across every ticket it manages —
+// NOT the day's grand total. Deliberately excludes manually-typed worklogs: the generator has no
+// way to judge whether a manual entry is legitimate or an accidental duplicate, so the cap can
+// only govern what this tool itself is responsible for. Counting manual entries too would mean a
+// heavy manual-logging day silently blocks this tool from recording real commit-based work at
+// all, which defeats the point of running it. Mirrors the scan delete-worklogs-by-date.js does
+// for the same JQL query, filtered to isManagedWorklog like the cleanup script.
+async function getLoggedSecondsForDate(jiraClient, date) {
+  let total = 0;
+  let startAt = 0;
+
+  for (;;) {
+    const response = await retry(
+      () => jiraClient.get(`${getJiraApiBasePath()}/search`, {
+        params: {
+          jql: `worklogDate = "${date}" AND worklogAuthor = currentUser()`,
+          fields: 'summary',
+          maxResults: 100,
+          startAt,
+        },
+      }),
+      3,
+      `Daily worklog total lookup for ${date}`,
+    );
+
+    const issues = response.data.issues || [];
+    for (const issue of issues) {
+      const worklogs = await fetchExistingWorklogs(jiraClient, issue.key);
+      for (const worklog of worklogs) {
+        if (typeof worklog.started !== 'string' || !worklog.started.startsWith(date)) {
+          continue;
+        }
+        if (isManagedWorklog(extractJiraCommentText(worklog.comment))) {
+          total += Number(worklog.timeSpentSeconds || 0);
+        }
+      }
+    }
+
+    startAt += issues.length;
+    if (issues.length < 100) break;
+  }
+
+  return total;
+}
+
 async function uploadToJira(jiraClient, timesheet, options = {}) {
   const results = [];
+  const maxDailySeconds = getMaxDailySeconds();
+  // Lazily-populated, per-date running total (seconds) of everything already logged in Jira for
+  // that date. Only checked before CREATING a new worklog — updating an already-existing one
+  // doesn't add net-new time, so it's never blocked by the cap.
+  const dailyTotals = new Map();
+
+  // Who this client actually authenticates as, so findMatchingWorklog never mistakes a
+  // colleague's worklog on a shared ticket (PF-6863, PF-6870, ...) for one of ours to update.
+  // Falls back to author-blind matching (the old behaviour) if this lookup fails for any reason
+  // — better to occasionally re-match loosely than to hard-fail the whole run over it.
+  let currentUser = null;
+  if (!options.dryRun) {
+    try {
+      currentUser = await getCurrentJiraUser(jiraClient);
+    } catch (error) {
+      console.warn(`Could not determine current Jira user (${getErrorMessage(error)}); worklog matching will not be author-scoped for this run.`);
+    }
+  }
 
   for (const day of timesheet) {
     for (const entry of day.entries) {
       if (entry.isCalendarEvent) {
+        // Calendar events are uploaded to Jira like any other entry (see buildWorklogComment's
+        // isCalendarEvent branch, which puts the meeting title front and center in the comment
+        // so it's always clear which meeting a worklog came from) — just log it distinctly first.
         console.log(`  [CALENDAR] ${day.date} ${entry.ticketId}: ${(entry.summary || entry.commitMessage || '').slice(0, 60)} (${entry.hours.toFixed(2)}h) @ ${getEntryStartedTimestamp(day.date, entry)}.`);
       }
 
@@ -1151,7 +1336,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
 
       try {
         const existingWorklogs = await fetchExistingWorklogs(jiraClient, issueKey);
-        const matchingWorklog = findMatchingWorklog(existingWorklogs, entry);
+        const matchingWorklog = findMatchingWorklog(existingWorklogs, entry, currentUser);
         if (matchingWorklog) {
           await retry(
             () => jiraClient.put(
@@ -1178,6 +1363,30 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
           continue;
         }
 
+        // Hard safety cap: never let a run push a day's real Jira total past the configured
+        // ceiling, no matter how many times it's re-run or how a matching bug might otherwise
+        // pile up duplicates. Only applies to brand-new worklogs — updating an existing one
+        // doesn't add net-new time, so that path above is never blocked by this.
+        if (!dailyTotals.has(day.date)) {
+          dailyTotals.set(day.date, await getLoggedSecondsForDate(jiraClient, day.date));
+        }
+        const loggedSoFar = dailyTotals.get(day.date);
+        if (loggedSoFar + entry.secondsSpent > maxDailySeconds) {
+          console.warn(
+            `[SKIPPED] ${day.date} ${issueKey} ${entry.hours}h ${entry.commitHash.slice(0, 8)}: `
+            + `${(loggedSoFar / 3600).toFixed(2)}h already logged for this day, adding this would `
+            + `exceed the ${(maxDailySeconds / 3600).toFixed(1)}h daily cap (TIMESHEET_MAX_DAILY_HOURS).`,
+          );
+          results.push({
+            date: day.date,
+            ticketId: issueKey,
+            status: 'skipped-daily-cap',
+            hours: entry.hours,
+            commitHash: entry.commitHash,
+          });
+          continue;
+        }
+
         await retry(
           () => jiraClient.post(`${getJiraApiBasePath()}/issue/${encodeURIComponent(issueKey)}/worklog`, {
             started: getEntryStartedTimestamp(day.date, entry),
@@ -1187,6 +1396,7 @@ async function uploadToJira(jiraClient, timesheet, options = {}) {
           3,
           `Worklog upload for ${issueKey} on ${day.date}`,
         );
+        dailyTotals.set(day.date, loggedSoFar + entry.secondsSpent);
 
         console.log(`[SUCCESS] ${day.date} ${issueKey} uploaded (${entry.hours}h, ${entry.commitHash.slice(0, 8)}).`);
         results.push({
@@ -1427,6 +1637,19 @@ module.exports = {
   retry,
   resolveDateRange,
   runGenerator,
+  // Exported for unit tests (test/scheduling.test.js) — not part of the CLI/API surface.
+  buildDailySchedule,
+  buildFixedEntries,
+  distributeUnits,
+  freeMinutesInWindow,
+  generateHours,
+  getCurrentJiraUser,
+  getLoggedSecondsForDate,
+  getMaxDailySeconds,
+  isSameJiraUser,
+  getWorklogTimezoneOffset,
+  pushPastBusyIntervals,
+  uploadToJira,
 };
 
 if (require.main === module) {

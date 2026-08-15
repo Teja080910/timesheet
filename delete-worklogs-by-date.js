@@ -5,6 +5,7 @@
 require('dotenv').config();
 
 const { createJiraClient, extractJiraCommentText, fetchExistingWorklogs, getErrorMessage, getJiraApiBasePath, retry } = require('./generate-timesheet');
+const { isManagedWorklog } = require('./worklog-utils');
 
 function parseArgs(argv) {
   let startDate = null;
@@ -17,8 +18,12 @@ function parseArgs(argv) {
       execute = true;
     } else if (arg === '--startDate' && i + 1 < argv.length) {
       startDate = argv[++i];
+    } else if (arg.startsWith('--startDate=')) {
+      startDate = arg.split('=')[1];
     } else if (arg === '--endDate' && i + 1 < argv.length) {
       endDate = argv[++i];
+    } else if (arg.startsWith('--endDate=')) {
+      endDate = arg.split('=')[1];
     } else if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) {
       if (!startDate) {
         startDate = arg;
@@ -51,10 +56,6 @@ function parseArgs(argv) {
   }
 
   return { dates, execute };
-}
-
-function isManagedWorklog(commentText) {
-  return commentText.includes('Daily fixed allocation slot [') || commentText.includes('Entry [') || commentText.match(/\[calendar-/);
 }
 
 async function main() {
