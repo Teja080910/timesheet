@@ -27,13 +27,27 @@ This project can now run in two modes:
 - `TIMESHEET_DEFAULT_TICKET` (optional, defaults to `PF-16716`)
 - `TIMESHEET_MEETING_TICKET` (optional, defaults to `PF-6870`)
 - `TIMESHEET_REQUIREMENT_MEETING_TICKET` (optional, defaults to `PF-6866`)
-- `TIMESHEET_MAX_DAILY_HOURS` (optional, defaults to `9.5`)
+- `TIMESHEET_MAX_DAILY_HOURS` (optional, defaults to `10.5`)
+- `TIMESHEET_DAILY_TARGET_MIN_HOURS` (optional, defaults to `9`)
+- `TIMESHEET_DAILY_TARGET_MAX_HOURS` (optional, defaults to `10`)
 
 `TIMESHEET_API_TOKEN` is required by the Vercel API route. Requests without it are rejected.
 
 The four `TIMESHEET_*` ticket variables let you change the hardcoded ticket IDs the
 generator falls back to (daily fixed allocation, unmatched commits, and untagged
 calendar meetings) without editing code.
+
+### Daily target range (`TIMESHEET_DAILY_TARGET_MIN_HOURS` / `_MAX_HOURS`)
+
+Each day's total logged time (fixed slot + commit work + meetings) is picked deterministically
+somewhere between these two bounds — the same date always lands on the same target when
+regenerated, but different dates land on different totals rather than an identical number every
+day. Set both to the same value to pin every day to one fixed total (e.g. the old behavior was
+equivalent to min=max=8).
+
+**If you raise this range, raise `TIMESHEET_MAX_DAILY_HOURS` too** — it's a safety ceiling *above*
+the target, not the target itself, and needs headroom over `_MAX_HOURS` or it will start
+skipping legitimate entries on days whose target lands close to or above the cap.
 
 ### Daily hour cap (`TIMESHEET_MAX_DAILY_HOURS`)
 
@@ -216,8 +230,8 @@ Generated Jira worklogs now follow your office schedule with randomized placemen
 - First half: `09:30` to `12:30`
 - Second half: `14:30` to `19:30`
 - Fixed daily allocation: `PF-6863` (override with `TIMESHEET_FIXED_TICKET`) for `0.5h` once in the first half and `0.5h` once in the second half
-- Daily total hours: fixed at `8.00h` for every day, calendar meetings included
-- If a calendar meeting overlaps the first-half or second-half window, commit work (and the fixed slot, if needed) is pushed around it and never overlaps the meeting. Any commit time that no longer fits in the daytime windows because of that overlap spills over to after `19:30` as evening work — the day's logged total still stays at exactly `8.00h`
+- Daily total hours: a deterministic value between `TIMESHEET_DAILY_TARGET_MIN_HOURS` and `TIMESHEET_DAILY_TARGET_MAX_HOURS` (default `9`–`10`) for every day, calendar meetings included — see "Daily target range" above
+- If a calendar meeting overlaps the first-half or second-half window, commit work (and the fixed slot, if needed) is pushed around it and never overlaps the meeting. Any commit time that no longer fits in the daytime windows because of that overlap — or because the day's target itself exceeds first-half + second-half capacity (150min + 270min) — spills over to after `19:30` as evening work; the day's logged total still lands exactly on its target
 - The schedule is deterministic per date, so rerunning the same date range updates the same Jira worklogs instead of creating duplicates
 
 **Important — do not set `JIRA_WORKLOG_TIMEZONE_OFFSET` to your real UTC offset (e.g. `+0530`).**

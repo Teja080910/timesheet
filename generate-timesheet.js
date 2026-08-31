@@ -698,14 +698,36 @@ function minutesToHours(minutes) {
   return Number((minutes / 60).toFixed(2));
 }
 
+function getDailyTargetHoursBound(envVar, fallbackHours) {
+  const raw = (process.env[envVar] || '').trim();
+  const hours = Number(raw);
+  return Number.isFinite(hours) && hours > 0 ? hours : fallbackHours;
+}
+
+function getDailyTargetRangeMinutes() {
+  const minHours = getDailyTargetHoursBound('TIMESHEET_DAILY_TARGET_MIN_HOURS', 9);
+  const maxHours = getDailyTargetHoursBound('TIMESHEET_DAILY_TARGET_MAX_HOURS', 10);
+  const minMinutes = Math.round(minHours * 60);
+  const maxMinutes = Math.round(maxHours * 60);
+  // Guard against a misconfigured max < min rather than produce a negative range.
+  return maxMinutes >= minMinutes ? { minMinutes, maxMinutes } : { minMinutes, maxMinutes: minMinutes };
+}
+
 function buildDailyTargetMinutes(dates) {
   if (dates.length === 0) {
     return new Map();
   }
 
+  const { minMinutes, maxMinutes } = getDailyTargetRangeMinutes();
+  const rangeSlots = Math.floor((maxMinutes - minMinutes) / SLOT_MINUTES);
+
   const targets = new Map();
   for (const date of dates) {
-    targets.set(date, MIN_WORKDAY_MINUTES);
+    // Deterministic per-date pick within [min, max], same hashing approach used for placement
+    // elsewhere — reruns for the same date always land on the same target, and the daily total
+    // varies day to day rather than being an identical, suspiciously-round number every time.
+    const offsetSlots = rangeSlots > 0 ? getDeterministicInt(`${date}:daily-target`, rangeSlots + 1) : 0;
+    targets.set(date, minMinutes + (offsetSlots * SLOT_MINUTES));
   }
 
   return targets;
@@ -999,6 +1021,8 @@ function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
 
   const firstHalfUnitsAvailable = Math.floor(firstHalfCapMinutes / SLOT_MINUTES);
   const secondHalfUnitsAvailable = Math.floor(secondHalfCapMinutes / SLOT_MINUTES);
+  const firstHalfWindowEnd = FIRST_HALF_START_MINUTES + FIRST_HALF_MINUTES;
+  const secondHalfWindowEnd = SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES;
 
   // Allocate greedily: fill the first half up to whatever's actually free there, spill the
   // remainder into the second half up to its own free capacity, and let anything left over
@@ -1010,7 +1034,18 @@ function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
     commitUnits.map((value) => value / totalCommitUnits),
   );
 
-  const remainingAfterFirst = commitUnits.map((value, index) => value - firstHalfAllocations[index]);
+  // Placement can still overflow past a window's true end even though the ALLOCATED total fits
+  // the window's free-capacity number: if a busy interval (the fixed slot, a meeting) sits well
+  // inside the window, dodging it can burn through more span than capacity math assumed, pushing
+  // a large single entry past the window boundary. schedulePlainSegmentEntries reports any such
+  // overflow so it can roll into the next segment instead of silently colliding with it.
+  const firstHalfResult = schedulePlainSegmentEntries(
+    entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, 'first-half', occupiedIntervals, firstHalfWindowEnd,
+  );
+
+  const remainingAfterFirst = commitUnits.map((value, index) => (
+    value - firstHalfAllocations[index] + firstHalfResult.overflowUnits[index]
+  ));
   const remainingAfterFirstTotal = remainingAfterFirst.reduce((sum, value) => sum + value, 0);
 
   const secondHalfTotalUnits = Math.min(remainingAfterFirstTotal, secondHalfUnitsAvailable);
@@ -1021,12 +1056,23 @@ function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
     )
     : remainingAfterFirst.map(() => 0);
 
-  const overtimeAllocations = remainingAfterFirst.map((value, index) => value - secondHalfAllocations[index]);
+  const secondHalfResult = schedulePlainSegmentEntries(
+    entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, 'second-half', occupiedIntervals, secondHalfWindowEnd,
+  );
+
+  const overtimeAllocations = remainingAfterFirst.map((value, index) => (
+    value - secondHalfAllocations[index] + secondHalfResult.overflowUnits[index]
+  ));
+
+  // "night" is uncapped (windowEndMinutes defaults to Infinity), so it can never overflow further.
+  const nightResult = schedulePlainSegmentEntries(
+    entries, overtimeAllocations, secondHalfWindowEnd, 'night', occupiedIntervals,
+  );
 
   const commitEntries = [
-    ...schedulePlainSegmentEntries(entries, firstHalfAllocations, FIRST_HALF_START_MINUTES, 'first-half', occupiedIntervals),
-    ...schedulePlainSegmentEntries(entries, secondHalfAllocations, SECOND_HALF_START_MINUTES, 'second-half', occupiedIntervals),
-    ...schedulePlainSegmentEntries(entries, overtimeAllocations, SECOND_HALF_START_MINUTES + SECOND_HALF_MINUTES, 'night', occupiedIntervals),
+    ...firstHalfResult.scheduled,
+    ...secondHalfResult.scheduled,
+    ...nightResult.scheduled,
   ];
 
   return {
@@ -1035,20 +1081,43 @@ function buildDailySchedule(date, entries, dailyMinutes, busyIntervals = []) {
   };
 }
 
-function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName, busyIntervals = []) {
+function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, segmentName, busyIntervals = [], windowEndMinutes = Infinity) {
   const scheduled = [];
+  const overflowUnits = entries.map(() => 0);
   let cursor = segmentStartMinutes;
 
   for (let index = 0; index < entries.length; index += 1) {
-    const allocatedUnits = allocations[index];
+    let allocatedUnits = allocations[index];
     if (allocatedUnits <= 0) {
       continue;
     }
 
-    const durationMinutes = allocatedUnits * SLOT_MINUTES;
+    let durationMinutes = allocatedUnits * SLOT_MINUTES;
     // Push the cursor past any busy interval (calendar meeting or fixed slot) that the full
     // [cursor, cursor+durationMinutes) span would overlap, not just cursor's starting point.
     cursor = pushPastBusyIntervals(cursor, durationMinutes, busyIntervals);
+
+    if (cursor >= windowEndMinutes) {
+      // No room left in this window at all — the whole allocation rolls into the next segment.
+      overflowUnits[index] += allocatedUnits;
+      continue;
+    }
+
+    const availableMinutes = windowEndMinutes - cursor;
+    if (durationMinutes > availableMinutes) {
+      // Only part of this entry fits before the window's true end. Place what fits here (in
+      // whole 5-minute slots) and carry the rest forward instead of letting it spill into
+      // whatever the next segment schedules right at this window's nominal boundary.
+      const fittingMinutes = Math.floor(availableMinutes / SLOT_MINUTES) * SLOT_MINUTES;
+      overflowUnits[index] += (durationMinutes - fittingMinutes) / SLOT_MINUTES;
+
+      if (fittingMinutes <= 0) {
+        continue;
+      }
+
+      durationMinutes = fittingMinutes;
+      allocatedUnits = fittingMinutes / SLOT_MINUTES;
+    }
 
     scheduled.push({
       ...entries[index],
@@ -1062,7 +1131,7 @@ function schedulePlainSegmentEntries(entries, allocations, segmentStartMinutes, 
     cursor += durationMinutes;
   }
 
-  return scheduled;
+  return { scheduled, overflowUnits };
 }
 
 // Strips characters outside the Basic Multilingual Plane (most emoji, e.g. 🧘 🚨). Some Jira
@@ -1237,9 +1306,12 @@ function normalizeJiraComment(text) {
 }
 
 function getMaxDailySeconds() {
-  const raw = (process.env.TIMESHEET_MAX_DAILY_HOURS || '9.5').trim();
+  // Default kept comfortably above the daily target range's own default max (10h, see
+  // TIMESHEET_DAILY_TARGET_MAX_HOURS) — this is a safety ceiling, not the target itself, so it
+  // must always leave headroom above whatever the target is configured to reach.
+  const raw = (process.env.TIMESHEET_MAX_DAILY_HOURS || '10.5').trim();
   const hours = Number(raw);
-  return (Number.isFinite(hours) && hours > 0 ? hours : 9.5) * 3600;
+  return (Number.isFinite(hours) && hours > 0 ? hours : 10.5) * 3600;
 }
 
 // Total this generator has itself logged in Jira for this date, across every ticket it manages —

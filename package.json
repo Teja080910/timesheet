@@ -7,7 +7,7 @@
     "start": "node generate-timesheet.js",
     "cleanup:duplicates": "node cleanup-jira-duplicates.js",
     "delete:worklogs": "node delete-worklogs-by-date.js",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "author": "",
   "license": "ISC",

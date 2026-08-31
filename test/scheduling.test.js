@@ -100,7 +100,9 @@ test('a heavy-meeting day: commit time is never over-scheduled on top of the mee
     .filter((entry) => !entry.isCalendarEvent)
     .reduce((sum, entry) => sum + entry.durationMinutes, 0);
 
-  assert.equal(nonCalendarMinutes, (day.totalHours * 60) - day.meetingMinutes);
+  // day.totalHours is rounded to 2 decimals for display, so re-deriving minutes from it needs a
+  // round (not a bare ===) to shake off floating-point noise for non-round-hour daily targets.
+  assert.equal(nonCalendarMinutes, Math.round(day.totalHours * 60) - day.meetingMinutes);
   assertNoOverlaps(day.entries);
 });
 
@@ -124,7 +126,7 @@ test('a meeting mid-morning pushes the fixed slot out of the meeting window', ()
   assert.equal(fixedEntries.length, 2);
 });
 
-test('a day with no meetings still totals exactly 8h (regression safety)', () => {
+test('a day with no meetings totals within the configured daily target range, deterministically', () => withEnv('TIMESHEET_DAILY_TARGET_MIN_HOURS', '9', () => withEnv('TIMESHEET_DAILY_TARGET_MAX_HOURS', '10', () => {
   const groupedCommits = new Map([
     ['2026-08-12', new Map([['PF-3000', [{ hash: 'cccccccccccc', message: 'work', repo: 'PF/repo' }]]])],
   ]);
@@ -132,9 +134,30 @@ test('a day with no meetings still totals exactly 8h (regression safety)', () =>
   const [day] = generateHours(groupedCommits, []);
   const totalMinutes = day.entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
 
-  assert.equal(totalMinutes, 480);
-  assert.equal(day.totalHours, 8);
+  assert.ok(totalMinutes >= 540 && totalMinutes <= 600, `expected 9h-10h (540-600min), got ${totalMinutes}min`);
+  assert.equal(Math.round(day.totalHours * 60), totalMinutes);
   assertNoOverlaps(day.entries);
+
+  // Same date + same commits must always land on the same target — reruns shouldn't drift.
+  const [dayAgain] = generateHours(groupedCommits, []);
+  const totalMinutesAgain = dayAgain.entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
+  assert.equal(totalMinutesAgain, totalMinutes);
+})));
+
+test('the daily target defaults to 9-10h when unconfigured, and honors a custom range', () => {
+  const groupedCommits = new Map([
+    ['2026-08-12', new Map([['PF-3000', [{ hash: 'cccccccccccc', message: 'work', repo: 'PF/repo' }]]])],
+  ]);
+
+  const [defaultDay] = generateHours(groupedCommits, []);
+  const defaultMinutes = defaultDay.entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
+  assert.ok(defaultMinutes >= 540 && defaultMinutes <= 600, `expected the 9-10h default, got ${defaultMinutes}min`);
+
+  return withEnv('TIMESHEET_DAILY_TARGET_MIN_HOURS', '4', () => withEnv('TIMESHEET_DAILY_TARGET_MAX_HOURS', '4', () => {
+    const [fixedDay] = generateHours(groupedCommits, []);
+    const fixedMinutes = fixedDay.entries.reduce((sum, entry) => sum + entry.durationMinutes, 0);
+    assert.equal(fixedMinutes, 240, 'a min==max range should pin the target to that exact value');
+  }));
 });
 
 test('uploadToJira creates a Jira worklog for calendar entries, with the meeting title clear in the comment', async () => {
