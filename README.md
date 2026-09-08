@@ -23,10 +23,10 @@ This project can now run in two modes:
 - `JIRA_TOKEN` or basic-auth Jira credentials
 - `JIRA_WORKLOG_TIMEZONE_OFFSET` (optional, defaults to `+0000`)
 - `TIMESHEET_API_TOKEN`
-- `TIMESHEET_FIXED_TICKET` (optional, defaults to `PF-6863`)
+- `TIMESHEET_FIXED_TICKET` (optional, defaults to `PF-20479`)
 - `TIMESHEET_DEFAULT_TICKET` (optional, defaults to `PF-16716`)
-- `TIMESHEET_MEETING_TICKET` (optional, defaults to `PF-6870`)
-- `TIMESHEET_REQUIREMENT_MEETING_TICKET` (optional, defaults to `PF-6866`)
+- `TIMESHEET_MEETING_TICKET` (optional, defaults to `PF-20200`)
+- `TIMESHEET_REQUIREMENT_MEETING_TICKET` (optional, defaults to `PF-20451`)
 - `TIMESHEET_MAX_DAILY_HOURS` (optional, defaults to `10.5`)
 - `TIMESHEET_DAILY_TARGET_MIN_HOURS` (optional, defaults to `9`)
 - `TIMESHEET_DAILY_TARGET_MAX_HOURS` (optional, defaults to `10`)
@@ -99,8 +99,8 @@ in the timesheet (marked as `[MEETING]`), and commit-based allocations adjust au
 7. Find your Calendar ID in Google Calendar settings → **Integrate calendar**
 
 Calendar events that contain a ticket ID (e.g. `PF-12345`) in the title will be tagged with
-that ticket. Untagged events default to `TIMESHEET_MEETING_TICKET` (`PF-6870`), or
-`TIMESHEET_REQUIREMENT_MEETING_TICKET` (`PF-6866`) if the title mentions "requirement".
+that ticket. Untagged events default to `TIMESHEET_MEETING_TICKET` (`PF-20200`), or
+`TIMESHEET_REQUIREMENT_MEETING_TICKET` (`PF-20451`) if the title mentions "requirement".
 
 Calendar entries **are** uploaded to Jira as their own worklog, just like commit-based
 entries — the worklog comment always leads with the meeting title (e.g.
@@ -194,12 +194,12 @@ admin slot, calendar meetings — you end up logging the same real time twice: o
 by the generator. The generator has no way to detect this; it only recognizes its own managed
 markers and leaves everything else alone by design. **The fix is behavioral, not technical: once
 you trust the generator to log your meetings (via Google Calendar sync) and daily admin time
-(`PF-6863`), stop logging those same things manually.** If you want to audit how much manual
+(`PF-20479`), stop logging those same things manually.** If you want to audit how much manual
 data has already accumulated, filter for worklogs whose comment does *not* contain `Entry [`,
 `Daily fixed allocation slot [`, or `[calendar-` — those are the ones this generator never
 touched.
 
-**3. Shared tickets used by more than one person.** `PF-6863` (and potentially others) get
+**3. Shared tickets used by more than one person.** `PF-20479` (and potentially others) get
 worklogs from anyone on the team running this same generator against their own commits/calendar
 — not just you. Matching is now scoped to worklogs authored by the account this Jira client
 actually authenticates as (checked via `/rest/api/2/myself`), so it will never mistake a
@@ -229,7 +229,7 @@ Generated Jira worklogs now follow your office schedule with randomized placemen
 
 - First half: `09:30` to `12:30`
 - Second half: `14:30` to `19:30`
-- Fixed daily allocation: `PF-6863` (override with `TIMESHEET_FIXED_TICKET`) for `0.5h` once in the first half and `0.5h` once in the second half
+- Fixed daily allocation: `PF-20479` (override with `TIMESHEET_FIXED_TICKET`) for `0.5h` once in the first half and `0.5h` once in the second half
 - Daily total hours: a deterministic value between `TIMESHEET_DAILY_TARGET_MIN_HOURS` and `TIMESHEET_DAILY_TARGET_MAX_HOURS` (default `9`–`10`) for every day, calendar meetings included — see "Daily target range" above
 - If a calendar meeting overlaps the first-half or second-half window, commit work (and the fixed slot, if needed) is pushed around it and never overlaps the meeting. Any commit time that no longer fits in the daytime windows because of that overlap — or because the day's target itself exceeds first-half + second-half capacity (150min + 270min) — spills over to after `19:30` as evening work; the day's logged total still lands exactly on its target
 - The schedule is deterministic per date, so rerunning the same date range updates the same Jira worklogs instead of creating duplicates
@@ -252,7 +252,7 @@ viewer on display (most Jira Server/Data Center instances do not).
 
 That means each generated workday is scheduled as:
 
-- One random `PF-6863` slot somewhere between `09:30` and `12:30`
-- One random `PF-6863` slot somewhere between `14:30` and `19:30`
+- One random `PF-20479` slot somewhere between `09:30` and `12:30`
+- One random `PF-20479` slot somewhere between `14:30` and `19:30`
 - Commit-based logs fill the rest of the first half and second half
 - If the day is above `8.00h`, the remaining time is added after `19:30`
