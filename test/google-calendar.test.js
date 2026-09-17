@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { collectPaginatedEvents } = require('../google-calendar');
+const { collectPaginatedEvents, isIgnoredMeetingTitle } = require('../google-calendar');
 
 function page(items, nextPageToken) {
   return Promise.resolve({ data: { items, nextPageToken } });
@@ -51,4 +51,23 @@ test('collectPaginatedEvents handles a single page with no token cleanly', async
 
   assert.deepEqual(result.items.map((i) => i.id), ['only']);
   assert.equal(result.truncated, false);
+});
+
+test('isIgnoredMeetingTitle drops the default noise titles, case-insensitively', () => {
+  assert.equal(isIgnoredMeetingTitle('Jai Gurudev :Good morning :Welcome to office'), true);
+  assert.equal(isIgnoredMeetingTitle('🧘 Bro... Drop Everything, It\'s Sadhana Time!'), true);
+  assert.equal(isIgnoredMeetingTitle('🚨 Final Acceptance Criteria: Work completed ✔️ Clock Out on Keka/Zimyo ✔️'), true);
+  assert.equal(isIgnoredMeetingTitle('5.3 Release - Scrum Call'), false);
+});
+
+test('isIgnoredMeetingTitle honors TIMESHEET_IGNORED_MEETING_TITLES override', () => {
+  const original = process.env.TIMESHEET_IGNORED_MEETING_TITLES;
+  process.env.TIMESHEET_IGNORED_MEETING_TITLES = 'lunch break, standup';
+  try {
+    assert.equal(isIgnoredMeetingTitle('Daily Standup'), true);
+    assert.equal(isIgnoredMeetingTitle('Jai Gurudev :Good morning :Welcome to office'), false, 'override replaces defaults, not adds to them');
+  } finally {
+    if (original === undefined) delete process.env.TIMESHEET_IGNORED_MEETING_TITLES;
+    else process.env.TIMESHEET_IGNORED_MEETING_TITLES = original;
+  }
 });

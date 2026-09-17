@@ -63,6 +63,27 @@ function getEventLabel() {
   return (process.env.GOOGLE_CALENDAR_EVENT_LABEL || 'Meeting').trim();
 }
 
+// Recurring calendar noise nobody wants logged as work time. Override via
+// TIMESHEET_IGNORED_MEETING_TITLES (comma-separated, case-insensitive substring match).
+const DEFAULT_IGNORED_MEETING_TITLES = [
+  'jai gurudev',
+  'sadhana time',
+  'final acceptance criteria',
+];
+
+function getIgnoredMeetingTitles() {
+  const raw = (process.env.TIMESHEET_IGNORED_MEETING_TITLES || '').trim();
+  if (!raw) {
+    return DEFAULT_IGNORED_MEETING_TITLES;
+  }
+  return raw.split(',').map((title) => title.trim().toLowerCase()).filter(Boolean);
+}
+
+function isIgnoredMeetingTitle(summary) {
+  const lower = (summary || '').toLowerCase();
+  return getIgnoredMeetingTitles().some((keyword) => lower.includes(keyword));
+}
+
 /**
  * Follows `nextPageToken` until either the range is exhausted or `maxEvents` items have been
  * collected. `fetchPage({ pageToken, maxResults })` must return a Google-Calendar-API-shaped
@@ -140,10 +161,17 @@ async function fetchCalendarEvents(range) {
 
   const items = result.items;
   const parsed = [];
+  let ignoredCount = 0;
 
   for (const event of items) {
     // Skip all-day / multi-day events without a specific time
     if (!event.start?.dateTime || !event.end?.dateTime) {
+      continue;
+    }
+
+    const summary = (event.summary || '(No title)').trim();
+    if (isIgnoredMeetingTitle(summary)) {
+      ignoredCount += 1;
       continue;
     }
 
@@ -157,7 +185,6 @@ async function fetchCalendarEvents(range) {
 
     const rawDate = event.start.dateTime.slice(0, 10);
     const date = rawDate;
-    const summary = (event.summary || '(No title)').trim();
     const ticketId = extractTicketFromEvent(summary);
 
     parsed.push({
@@ -176,7 +203,10 @@ async function fetchCalendarEvents(range) {
     });
   }
 
-  console.log(`Found ${parsed.length} calendar event(s).`);
+  console.log(
+    `Found ${parsed.length} calendar event(s).`
+    + (ignoredCount > 0 ? ` (${ignoredCount} ignored by TIMESHEET_IGNORED_MEETING_TITLES)` : ''),
+  );
   return parsed;
 }
 
@@ -192,6 +222,7 @@ module.exports = {
   fetchCalendarEvents,
   getCalendarConfig,
   extractTicketFromEvent,
+  isIgnoredMeetingTitle,
   // Exported for unit tests (test/scheduling.test.js) — not part of the module's public surface.
   collectPaginatedEvents,
 };

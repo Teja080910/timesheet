@@ -87,6 +87,7 @@ in the timesheet (marked as `[MEETING]`), and commit-based allocations adjust au
 | `GOOGLE_CALENDAR_ID` | Calendar ID to fetch events from |
 | `GOOGLE_CALENDAR_MAX_EVENTS` | Max events per fetch, across all pages (default: `500`) |
 | `GOOGLE_CALENDAR_EVENT_LABEL` | Label prefix (default: `Meeting`) |
+| `TIMESHEET_IGNORED_MEETING_TITLES` | Comma-separated, case-insensitive substrings; matching events are dropped entirely — not logged, not counted as meeting time, don't block commit-time placement (default: `jai gurudev,sadhana time,final acceptance criteria`) |
 
 **Setup steps:**
 
